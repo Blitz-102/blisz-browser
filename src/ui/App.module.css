@@ -80,37 +80,38 @@
   color: var(--color-text-muted);
 }
 
-.tab {
-  width: 100%;
-  height: var(--tab-height);
+/* Sits at the bottom of the sidebar. */
+.memoryToggle {
+  display: flex;
+  flex: none;
+  gap: var(--space-2);
+  align-items: center;
+  align-self: flex-start;
+  height: var(--icon-button-size);
+  margin-top: auto;
   padding: 0 var(--space-3);
   border: 0;
   border-radius: var(--radius-md);
   background: transparent;
-  text-align: left;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
   transition: background var(--duration-fast);
 }
 
-.tab:hover {
+.memoryToggle:hover {
   background: var(--color-surface-hover);
 }
 
-.tab:focus-visible {
+.memoryToggle:focus-visible {
   outline: var(--focus-ring-width) solid var(--color-accent);
   outline-offset: var(--focus-ring-offset);
 }
 
-.tabActive,
-.tabActive:hover {
+.memoryToggle[aria-pressed="true"],
+.memoryToggle[aria-pressed="true"]:hover {
   background: var(--color-surface);
   box-shadow: var(--shadow-soft);
-}
-
-/* Sits at the bottom of the sidebar; the rest of its look comes from .tab. */
-.memoryToggle {
-  margin-top: auto;
-  color: var(--color-text-muted);
-  font-size: var(--font-size-sm);
+  color: var(--color-text);
 }
 
 .page {
@@ -124,4 +125,27 @@
   box-shadow: var(--shadow-card);
   color: var(--color-text-muted);
   overflow: auto;
+}
+
+.placeholder {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  align-items: center;
+  max-width: 100%;
+  padding: 0 var(--space-3);
+  text-align: center;
+  /* Phase 2 titles and URLs come from pages and can be one long unbroken string. */
+  overflow-wrap: anywhere;
+}
+
+.placeholderTitle {
+  margin: 0;
+  font-size: var(--font-size-md);
+}
+
+.placeholderUrl {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
 }

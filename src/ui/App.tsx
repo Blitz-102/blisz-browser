@@ -1,6 +1,12 @@
 import { useState } from 'react';
 import styles from './App.module.css';
-import { ArrowLeftIcon, ArrowRightIcon, RotateCwIcon, ShieldIcon } from './icons/icons';
+import {
+  ActivityIcon,
+  ArrowLeftIcon,
+  ArrowRightIcon,
+  RotateCwIcon,
+  ShieldIcon,
+} from './icons/icons';
 import { MemoryPanel } from './MemoryPanel';
 import { initialTabs, type Tab } from './mockData';
 import { PinnedSites } from './PinnedSites';
@@ -73,18 +79,26 @@ export function App() {
         <TabList tabs={tabs} onSelect={selectTab} onClose={closeTab} onNewTab={addTab} />
         <button
           type="button"
-          className={
-            memoryOpen
-              ? `${styles.tab} ${styles.tabActive} ${styles.memoryToggle}`
-              : `${styles.tab} ${styles.memoryToggle}`
-          }
+          className={styles.memoryToggle}
           aria-pressed={memoryOpen}
           onClick={() => setMemoryOpen(!memoryOpen)}
         >
+          <ActivityIcon />
           Memory
         </button>
       </nav>
-      <main className={styles.page}>{memoryOpen ? <MemoryPanel /> : 'No page loaded'}</main>
+      <main className={styles.page}>
+        {memoryOpen ? (
+          <MemoryPanel />
+        ) : activeTab ? (
+          <div className={styles.placeholder}>
+            <p className={styles.placeholderTitle}>{activeTab.title}</p>
+            <p className={styles.placeholderUrl}>{activeTab.url}</p>
+          </div>
+        ) : (
+          <p className={styles.placeholderTitle}>No tab open</p>
+        )}
+      </main>
     </div>
   );
 }

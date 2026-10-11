@@ -165,7 +165,12 @@ function createWindow(): WebContents {
       if (!app.isPackaged) console.warn('Could not read window colours from the UI:', error);
     } finally {
       clearTimeout(timer);
-      if (!window.isDestroyed()) window.show();
+      if (!window.isDestroyed()) {
+        // Without this, showing the window makes Chromium tab into the view's first focusable
+        // element, so Back opens with a focus ring. Focusing the view first prevents that.
+        uiView.webContents.focus();
+        window.show();
+      }
     }
   });
 
