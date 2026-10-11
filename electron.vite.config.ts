@@ -15,6 +15,7 @@ const devCsp = [
   "object-src 'none'",
   "base-uri 'none'",
   "form-action 'none'",
+  "require-trusted-types-for 'script'",
 ].join('; ');
 
 export default defineConfig({
@@ -39,11 +40,11 @@ export default defineConfig({
       {
         name: 'dev-csp',
         apply: 'serve',
-        transformIndexHtml: (html) =>
-          html.replace(
-            /(<meta http-equiv="Content-Security-Policy" content=")[^"]*(")/,
-            `$1${devCsp}$2`,
-          ),
+        transformIndexHtml: (html) => {
+          const csp = /(<meta\s+http-equiv="Content-Security-Policy"\s+content=")[^"]*(")/;
+          if (!csp.test(html)) throw new Error('dev-csp: CSP meta tag not found in index.html');
+          return html.replace(csp, `$1${devCsp}$2`);
+        },
       },
     ],
   },
