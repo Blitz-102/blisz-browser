@@ -14,11 +14,15 @@ import { runBench } from './bench';
 import { addTrustedUi, handleFromUi, UI_URL } from './ipc';
 import { getMetrics } from './metrics';
 
-// Temporary caption buttons; the real window-controls decision is in Phase 1 (PLAN 4.6).
-// Keep in sync with src/ui/styles/tokens.css (--color-frame, --color-text, --titlebar-height).
-const FRAME_COLOR = '#d9e3dc';
+// Native caption buttons via titleBarOverlay (PLAN 4.6); colours come from tokens.css.
+// Fallbacks for --color-frame and --color-text, used only if reading them from the UI fails.
+const FRAME_FALLBACK = '#e0ddd5';
 const SYMBOL_COLOR = '#1f2a26';
+// Keep in sync with --titlebar-height in tokens.css: the overlay height is fixed at creation.
 const TITLE_BAR_HEIGHT = 40;
+// Opaque colours only, as Chromium returns them: a translucent body must not make the window transparent.
+const OPAQUE_RGB = /^rgb\(\d{1,3}, \d{1,3}, \d{1,3}\)$/;
+const READ_COLORS_TIMEOUT_MS = 2000;
 
 Menu.setApplicationMenu(null);
 
@@ -101,9 +105,14 @@ function createWindow(): WebContents {
     minWidth: 800,
     minHeight: 500,
     show: false,
-    backgroundColor: FRAME_COLOR,
+    backgroundColor: FRAME_FALLBACK, // never visible: the window stays hidden until the colours are applied
     titleBarStyle: 'hidden',
-    titleBarOverlay: { color: FRAME_COLOR, symbolColor: SYMBOL_COLOR, height: TITLE_BAR_HEIGHT },
+    // Transparent, so the UI view's frame colour shows behind the native caption buttons.
+    titleBarOverlay: {
+      color: 'rgba(0, 0, 0, 0)',
+      symbolColor: SYMBOL_COLOR,
+      height: TITLE_BAR_HEIGHT,
+    },
   });
 
   const uiView = new WebContentsView({
@@ -117,7 +126,6 @@ function createWindow(): WebContents {
     },
   });
   addTrustedUi(uiView.webContents);
-  uiView.setBackgroundColor(FRAME_COLOR);
   window.contentView.addChildView(uiView);
 
   // getContentBounds() is in screen coordinates; the view needs window-relative ones.
@@ -128,8 +136,38 @@ function createWindow(): WebContents {
   window.on('resize', fitUiView);
   fitUiView();
 
-  // Show the window even if the UI fails to load, so it is never left invisible.
-  uiView.webContents.once('did-stop-loading', () => window.show());
+  // Once loaded, take the chrome colours from tokens.css. Show the window even if the UI fails to
+  // load, hangs or returns invalid colours, so it is never left invisible.
+  uiView.webContents.once('did-stop-loading', async () => {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      const colors: unknown = await Promise.race([
+        uiView.webContents.executeJavaScript(
+          '[getComputedStyle(document.body).backgroundColor, getComputedStyle(document.body).color]',
+        ),
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error('timed out')), READ_COLORS_TIMEOUT_MS);
+        }),
+      ]);
+      if (window.isDestroyed()) return;
+      if (
+        !Array.isArray(colors) ||
+        colors.length !== 2 ||
+        !colors.every((color) => typeof color === 'string' && OPAQUE_RGB.test(color))
+      ) {
+        throw new Error('unexpected colours');
+      }
+      const [frame, text] = colors as [string, string];
+      window.setBackgroundColor(frame);
+      uiView.setBackgroundColor(frame);
+      window.setTitleBarOverlay({ symbolColor: text });
+    } catch (error) {
+      if (!app.isPackaged) console.warn('Could not read window colours from the UI:', error);
+    } finally {
+      clearTimeout(timer);
+      if (!window.isDestroyed()) window.show();
+    }
+  });
 
   // WebContentsView contents are not destroyed with the window.
   window.on('closed', () => uiView.webContents.close());

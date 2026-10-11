@@ -2,6 +2,27 @@
 
 Newest at the top. Each entry: what was chosen, what else was considered, why, and when to revisit.
 
+## 2026-10-11: Phase 1 scope for the optional mockup parts
+- Chosen: build the pinned sites grid (mock data). Leave out the Space switcher dots and the settings button for now; the bottom row keeps only the Memory toggle.
+- Alternatives considered: building all three, or none.
+- Why: the user's choice. Spaces stay a Phase 9 decision (open decision #19); the settings button returns when the console exists.
+- Revisit if: Spaces or the console are built.
+- Status: settled
+
+## 2026-10-11: Icons as inline SVG components, copied from Lucide
+- Chosen: a handful of Lucide icons as small React components in `src/ui/icons/`, coloured with `currentColor`, with Lucide's licence file kept alongside.
+- Alternatives considered: the `lucide-react` package.
+- Why: about 8 icons don't justify a dependency. Inline SVG elements need no Trusted Types policy.
+- Revisit if: the icon count grows past about 30.
+- Status: settled
+
+## 2026-10-11: Window controls, native overlay that follows the tokens
+- Chosen: `titleBarStyle: 'hidden'` with a transparent `titleBarOverlay`. After the UI loads, main reads the computed `body` background and text colour from the UI view (a fixed `executeJavaScript` script, opaque `rgb()` only, 2 s timeout, shape-checked) and applies them to the window background and the caption symbols.
+- Alternatives considered: custom buttons in the sidebar (loses Snap Layouts); a new IPC call from the UI to set the colours; reading the colours in an isolated world.
+- Why: native buttons keep Snap Layouts, and `tokens.css` stays the single place to set the colours. Pulling from main adds no IPC surface. The isolated world was skipped: a compromised UI can at most recolour its own window. The user confirmed on Windows that the strip matches the frame.
+- Revisit if: a dark theme arrives (inactive-window glyph colour is system-controlled), or tokens move to non-sRGB colours such as `oklch()`, which this check rejects.
+- Status: settled
+
 ## 2026-10-11: LF line endings via .gitattributes
 - Chosen: `* text=auto eol=lf` (fonts marked binary).
 - Alternatives considered: changing Biome to CRLF; changing the global `core.autocrlf`.
