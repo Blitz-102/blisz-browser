@@ -2,6 +2,20 @@
 
 Newest at the top. Each entry: what was chosen, what else was considered, why, and when to revisit.
 
+## 2026-10-11: Focus the UI view before showing the window
+- Chosen: main calls `uiView.webContents.focus()` just before `window.show()`.
+- Alternatives considered: blurring the focused element from the UI after load; leaving it alone.
+- Why: when the window is activated, Chromium tabs into the view's first focusable element. It counts as keyboard focus, so Back opened with a focus ring. Focusing the view first prevents it, and focusing after the show is too late (measured). A smoke check covers it.
+- Revisit if: Phase 2 adds page views. The new tab or restored page may then be the better initial focus.
+- Status: settled
+
+## 2026-10-11: Smoke screenshot at 1280×800 with device scale factor 1
+- Chosen: the smoke test launches with `--force-device-scale-factor=1`, sets the content size to 1280×800, waits until the viewport matches, and saves `test-results/sidebar-1280x800.png` before any interaction.
+- Alternatives considered: testing at the laptop's real 125% scaling.
+- Why: at 125%, `setContentSize(1280, 800)` comes out at 1280×801 (rounding), so an exact-size check can't pass. Scale factor 1 gives the same image on any display. The app itself is unaffected.
+- Revisit if: a DPI-specific layout bug turns up; then add a check at the real scaling.
+- Status: settled
+
 ## 2026-10-11: Phase 1 scope for the optional mockup parts
 - Chosen: build the pinned sites grid (mock data). Leave out the Space switcher dots and the settings button for now; the bottom row keeps only the Memory toggle.
 - Alternatives considered: building all three, or none.
