@@ -2,15 +2,43 @@ import { useState } from 'react';
 import styles from './App.module.css';
 import { ArrowLeftIcon, ArrowRightIcon, RotateCwIcon, ShieldIcon } from './icons/icons';
 import { MemoryPanel } from './MemoryPanel';
-
-const tabs = [
-  { title: 'Example tab', active: true },
-  { title: 'Another tab', active: false },
-  { title: 'Third tab', active: false },
-];
+import { initialTabs, type Tab } from './mockData';
+import { PinnedSites } from './PinnedSites';
+import { TabList } from './TabList';
 
 export function App() {
   const [memoryOpen, setMemoryOpen] = useState(false);
+  const [tabs, setTabs] = useState(initialTabs);
+  const activeTab = tabs.find((tab) => tab.state === 'active');
+
+  // A tab that becomes active wakes up; the previously active one goes back to normal.
+  function selectTab(id: string) {
+    setTabs(
+      tabs.map((tab): Tab => {
+        if (tab.id === id) return { ...tab, state: 'active' };
+        return tab.state === 'active' ? { ...tab, state: 'normal' } : tab;
+      }),
+    );
+  }
+
+  function closeTab(id: string) {
+    const index = tabs.findIndex((tab) => tab.id === id);
+    const remaining = tabs.filter((tab) => tab.id !== id);
+    if (id === activeTab?.id && remaining.length > 0) {
+      const neighbour = remaining[Math.min(index, remaining.length - 1)];
+      setTabs(remaining.map((tab): Tab => (tab === neighbour ? { ...tab, state: 'active' } : tab)));
+    } else {
+      setTabs(remaining);
+    }
+  }
+
+  function addTab() {
+    const newTab: Tab = { id: crypto.randomUUID(), title: 'New tab', url: '', state: 'active' };
+    setTabs([
+      ...tabs.map((tab): Tab => (tab.state === 'active' ? { ...tab, state: 'normal' } : tab)),
+      newTab,
+    ]);
+  }
 
   return (
     <div className={styles.frame}>
@@ -32,7 +60,8 @@ export function App() {
             className={styles.addressInput}
             aria-label="Address"
             placeholder="Search or enter address"
-            defaultValue="https://example.com"
+            key={activeTab?.id}
+            defaultValue={activeTab?.url}
             spellCheck={false}
             onFocus={(event) => event.currentTarget.select()}
           />
@@ -40,19 +69,8 @@ export function App() {
             <ShieldIcon />
           </button>
         </div>
-        <ul className={styles.tabList}>
-          {tabs.map((tab) => (
-            <li key={tab.title}>
-              <button
-                type="button"
-                aria-current={tab.active ? 'true' : undefined}
-                className={tab.active ? `${styles.tab} ${styles.tabActive}` : styles.tab}
-              >
-                {tab.title}
-              </button>
-            </li>
-          ))}
-        </ul>
+        <PinnedSites />
+        <TabList tabs={tabs} onSelect={selectTab} onClose={closeTab} onNewTab={addTab} />
         <button
           type="button"
           className={

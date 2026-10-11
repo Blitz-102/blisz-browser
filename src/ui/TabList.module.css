@@ -1,0 +1,112 @@
+/* Only this list scrolls; the rest of the sidebar stays fixed. */
+.list {
+  display: flex;
+  flex: 0 1 auto;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-height: 0;
+  /* Padding keeps focus rings from being clipped by the scroll container; the negative margin cancels it. */
+  margin: calc(-1 * var(--space-1));
+  padding: var(--space-1);
+  overflow-y: auto;
+  list-style: none;
+  scrollbar-color: var(--color-border) transparent;
+  scrollbar-width: thin;
+}
+
+.row {
+  display: flex;
+  flex: none;
+  align-items: center;
+  height: var(--tab-height);
+  border-radius: var(--radius-md);
+  transition: background var(--duration-fast);
+}
+
+.row:hover {
+  background: var(--color-surface-hover);
+}
+
+.rowActive,
+.rowActive:hover {
+  background: var(--color-surface);
+  box-shadow: var(--shadow-soft);
+}
+
+.select {
+  display: flex;
+  gap: var(--space-2);
+  flex: 1;
+  align-items: center;
+  min-width: 0;
+  height: 100%;
+  padding: 0 var(--space-3);
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  text-align: left;
+}
+
+.select:focus-visible,
+.close:focus-visible {
+  outline: var(--focus-ring-width) solid var(--color-accent);
+  outline-offset: var(--focus-ring-offset);
+}
+
+.favicon {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: var(--favicon-size);
+  height: var(--favicon-size);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-translucent);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-strong);
+}
+
+.faviconSleeping {
+  border: var(--border-width) dashed var(--color-text-muted);
+  opacity: var(--sleeping-opacity);
+}
+
+.title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.titleSleeping {
+  composes: title;
+  font-style: italic;
+}
+
+.close {
+  display: flex;
+  flex: none;
+  margin-right: var(--space-1);
+  align-items: center;
+  justify-content: center;
+  width: var(--icon-button-size);
+  height: var(--icon-button-size);
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--color-text-muted);
+  opacity: 0;
+  transition:
+    background var(--duration-fast),
+    opacity var(--duration-fast);
+}
+
+.row:hover .close,
+.row:focus-within .close {
+  opacity: 1;
+}
+
+.close:hover {
+  background: var(--color-surface-hover);
+}
