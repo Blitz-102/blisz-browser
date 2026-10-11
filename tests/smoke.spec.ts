@@ -10,6 +10,10 @@ test('sidebar renders and the memory panel lists processes', async () => {
   try {
     const page = await app.firstWindow();
     await expect(page.getByRole('navigation', { name: 'Tabs' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Back' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Forward' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Reload' })).toBeVisible();
+    await expect(page.getByRole('textbox', { name: 'Address' })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Example tab' })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Another tab' })).toBeVisible();
 

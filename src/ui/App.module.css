@@ -15,22 +15,69 @@
 }
 
 /* Native caption buttons are drawn at the top right; the top of the sidebar drags the window. */
-.dragRegion {
+.topStrip {
+  display: flex;
   flex: none;
+  gap: var(--space-1);
+  align-items: center;
   height: var(--titlebar-height);
   -webkit-app-region: drag;
 }
 
+.iconButton {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: var(--icon-button-size);
+  height: var(--icon-button-size);
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--color-text-muted);
+  transition: background var(--duration-fast);
+  -webkit-app-region: no-drag;
+}
+
+.iconButton:hover {
+  background: var(--color-surface-hover);
+}
+
+.iconButton:focus-visible {
+  outline: var(--focus-ring-width) solid var(--color-accent);
+  outline-offset: var(--focus-ring-offset);
+}
+
 .address {
   display: flex;
+  flex: none;
   align-items: center;
   height: var(--address-height);
-  padding: 0 var(--space-3);
+  padding: 0 var(--space-1) 0 var(--space-3);
   border-radius: var(--radius-md);
   background: var(--color-surface-translucent);
-  color: var(--color-text-muted);
+}
+
+.address:focus-within {
+  outline: var(--focus-ring-width) solid var(--color-accent);
+  outline-offset: var(--focus-ring-offset);
+}
+
+.addressInput {
+  flex: 1;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--color-text);
   font-family: var(--font-mono);
   font-size: var(--font-size-sm);
+}
+
+.addressInput::placeholder {
+  color: var(--color-text-muted);
 }
 
 .tabList {
