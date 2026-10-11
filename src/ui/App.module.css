@@ -1,0 +1,81 @@
+.frame {
+  display: flex;
+  gap: var(--space-2);
+  height: 100%;
+  padding: 0 var(--space-2) var(--space-2);
+  background: var(--color-frame);
+}
+
+.sidebar {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  gap: var(--space-2);
+  width: var(--sidebar-width);
+}
+
+/* Native caption buttons are drawn at the top right; the top of the sidebar drags the window. */
+.dragRegion {
+  flex: none;
+  height: var(--titlebar-height);
+  -webkit-app-region: drag;
+}
+
+.address {
+  display: flex;
+  align-items: center;
+  height: var(--address-height);
+  padding: 0 var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-translucent);
+  color: var(--color-text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+}
+
+.tabList {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.tab {
+  width: 100%;
+  height: var(--tab-height);
+  padding: 0 var(--space-3);
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  text-align: left;
+  transition: background var(--duration-fast);
+}
+
+.tab:hover {
+  background: var(--color-surface-hover);
+}
+
+.tab:focus-visible {
+  outline: var(--focus-ring-width) solid var(--color-accent);
+  outline-offset: var(--focus-ring-offset);
+}
+
+.tabActive,
+.tabActive:hover {
+  background: var(--color-surface);
+  box-shadow: var(--shadow-soft);
+}
+
+.page {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  justify-content: center;
+  margin-top: var(--titlebar-height);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  box-shadow: var(--shadow-card);
+  color: var(--color-text-muted);
+}

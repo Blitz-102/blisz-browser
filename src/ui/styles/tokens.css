@@ -1,0 +1,53 @@
+/* Design tokens: edit values here to restyle the whole UI. Components use only var(--token). */
+:root {
+  /* Colours */
+  --color-frame: hsl(42, 15%, 87%);
+  --color-accent: #2f7a62;
+  --color-text: #1f2a26;
+  --color-text-muted: #56655e;
+  --color-surface: #ffffff;
+  --color-surface-hover: rgba(255, 255, 255, 0.4);
+  --color-surface-translucent: rgba(255, 255, 255, 0.55);
+  --color-border: rgba(31, 42, 38, 0.1);
+
+  /* Fonts */
+  --font-ui: "Geist", system-ui, "Segoe UI", sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+
+  /* Font sizes */
+  --font-size-sm: 12px;
+  --font-size-md: 13px;
+
+  /* Radii */
+  --radius-md: 10px;
+
+  /* Focus ring */
+  --focus-ring-width: 2px;
+  --focus-ring-offset: 2px;
+
+  /* Spacing scale */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+
+  /* Sizes */
+  --sidebar-width: 260px;
+  --titlebar-height: 40px;
+  --tab-height: 36px;
+  --address-height: 38px;
+
+  /* Shadows */
+  --shadow-soft: 0 1px 3px rgba(31, 42, 38, 0.12);
+  --shadow-card: 0 1px 4px rgba(31, 42, 38, 0.08), 0 4px 16px rgba(31, 42, 38, 0.06);
+
+  /* Motion */
+  --duration-fast: 120ms;
+  --duration-normal: 200ms;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --duration-fast: 0ms;
+    --duration-normal: 0ms;
+  }
+}

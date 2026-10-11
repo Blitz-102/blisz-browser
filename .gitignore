@@ -1,0 +1,14 @@
+# Dependencies and build output
+node_modules/
+out/
+dist/
+
+# Local benchmark and test output
+bench-results/
+test-results/
+*.log
+
+# Local-only working notes and agent config
+PLAN.md
+CLAUDE.md
+.claude/
