@@ -3,5 +3,6 @@ interface Window {
   bliss: {
     platform: NodeJS.Platform;
     getVersion(): Promise<string>;
+    getMetrics(): Promise<import('../shared/metrics').MetricsResult>;
   };
 }

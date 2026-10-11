@@ -68,6 +68,13 @@
   box-shadow: var(--shadow-soft);
 }
 
+/* Sits at the bottom of the sidebar; the rest of its look comes from .tab. */
+.memoryToggle {
+  margin-top: auto;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+}
+
 .page {
   display: flex;
   flex: 1;
@@ -78,4 +85,5 @@
   background: var(--color-surface);
   box-shadow: var(--shadow-card);
   color: var(--color-text-muted);
+  overflow: auto;
 }

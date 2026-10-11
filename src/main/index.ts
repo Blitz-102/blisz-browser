@@ -1,7 +1,18 @@
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { app, BaseWindow, Menu, net, protocol, session, WebContentsView } from 'electron';
+import {
+  app,
+  BaseWindow,
+  Menu,
+  net,
+  protocol,
+  session,
+  type WebContents,
+  WebContentsView,
+} from 'electron';
+import { runBench } from './bench';
 import { addTrustedUi, handleFromUi, UI_URL } from './ipc';
+import { getMetrics } from './metrics';
 
 // Temporary caption buttons; the real window-controls decision is in Phase 1 (PLAN 4.6).
 // Keep in sync with src/ui/styles/tokens.css (--color-frame, --color-text, --titlebar-height).
@@ -83,7 +94,7 @@ function denyAllPermissions(targetSession: Electron.Session): void {
 }
 app.on('session-created', denyAllPermissions);
 
-function createWindow(): void {
+function createWindow(): WebContents {
   const window = new BaseWindow({
     width: 1280,
     height: 800,
@@ -137,12 +148,18 @@ function createWindow(): void {
   }
 
   uiView.webContents.loadURL(UI_URL);
+  return uiView.webContents;
 }
 
 app.whenReady().then(() => {
   session.defaultSession.protocol.handle('blisz', serveUiFiles);
   handleFromUi('app:get-version', () => app.getVersion());
-  createWindow();
+  const ui = createWindow();
+  handleFromUi('metrics:get', () => getMetrics(ui.getOSProcessId()));
+  // `npm run bench:memory` passes --bench; never honoured in a packaged app.
+  if (!app.isPackaged && process.argv.includes('--bench')) {
+    runBench(ui);
+  }
 });
 
 app.on('window-all-closed', () => {

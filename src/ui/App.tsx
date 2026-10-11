@@ -1,4 +1,6 @@
+import { useState } from 'react';
 import styles from './App.module.css';
+import { MemoryPanel } from './MemoryPanel';
 
 const tabs = [
   { title: 'Example tab', active: true },
@@ -7,6 +9,8 @@ const tabs = [
 ];
 
 export function App() {
+  const [memoryOpen, setMemoryOpen] = useState(false);
+
   return (
     <div className={styles.frame}>
       <nav className={styles.sidebar} aria-label="Tabs">
@@ -25,8 +29,20 @@ export function App() {
             </li>
           ))}
         </ul>
+        <button
+          type="button"
+          className={
+            memoryOpen
+              ? `${styles.tab} ${styles.tabActive} ${styles.memoryToggle}`
+              : `${styles.tab} ${styles.memoryToggle}`
+          }
+          aria-pressed={memoryOpen}
+          onClick={() => setMemoryOpen(!memoryOpen)}
+        >
+          Memory
+        </button>
       </nav>
-      <main className={styles.page}>No page loaded</main>
+      <main className={styles.page}>{memoryOpen ? <MemoryPanel /> : 'No page loaded'}</main>
     </div>
   );
 }
