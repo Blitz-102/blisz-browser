@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { TabInfo } from './tabs';
+import type { TabInfo, TabsState } from './tabs';
 import { applyTabsUpdate, diffTabInfo } from './tabsUpdate';
 
 const tab: TabInfo = {
@@ -9,7 +9,10 @@ const tab: TabInfo = {
   isLoading: false,
   canGoBack: false,
   canGoForward: false,
+  favicon: null,
 };
+
+const state: TabsState = { activeId: 1, order: [1, 2], tabs: [tab, { ...tab, id: 2 }] };
 
 describe('diffTabInfo', () => {
   it('returns everything when there is no previous value', () => {
@@ -26,20 +29,48 @@ describe('diffTabInfo', () => {
       title: 'New',
     });
   });
+
+  it('reports a favicon change', () => {
+    const favicon = 'data:image/png;base64,AAAA';
+    expect(diffTabInfo(tab, { ...tab, favicon })).toEqual({ favicon });
+  });
 });
 
 describe('applyTabsUpdate', () => {
   it('merges changed fields and the active id', () => {
-    const state = { activeId: 1, tabs: [tab, { ...tab, id: 2 }] };
-    const next = applyTabsUpdate(state, { activeId: 2, tabs: { 1: { title: 'Changed' } } });
+    const next = applyTabsUpdate(state, {
+      activeId: 2,
+      order: [1, 2],
+      tabs: { 1: { title: 'Changed' } },
+    });
     expect(next.activeId).toBe(2);
     expect(next.tabs[0]?.title).toBe('Changed');
     expect(next.tabs[1]).toEqual(state.tabs[1]);
   });
 
+  it('adds a new tab at its place in the order', () => {
+    const added = { ...tab, id: 3, title: 'Added' };
+    const next = applyTabsUpdate(state, {
+      activeId: 3,
+      order: [1, 3, 2],
+      tabs: { 3: added },
+    });
+    expect(next.order).toEqual([1, 3, 2]);
+    expect(next.tabs[1]).toEqual(added);
+  });
+
+  it('removes tabs and follows the new order', () => {
+    const next = applyTabsUpdate(state, { activeId: 2, order: [2], tabs: {} });
+    expect(next.order).toEqual([2]);
+    expect(next.tabs).toEqual([state.tabs[1]]);
+  });
+
   it('gives the same result when applied twice', () => {
-    const state = { activeId: 1, tabs: [tab] };
-    const update = { activeId: 1, tabs: { 1: { isLoading: true } } };
+    const update = {
+      activeId: 3,
+      order: [3, 2],
+      tabs: { 3: { ...tab, id: 3 }, 2: { isLoading: true } },
+    };
     const once = applyTabsUpdate(state, update);
     expect(applyTabsUpdate(once, update)).toEqual(once);
   });

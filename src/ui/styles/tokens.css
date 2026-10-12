@@ -49,6 +49,11 @@
   --pinned-tile-size: 46px;
   --favicon-size: 18px;
 
+  /* Loading indicator */
+  --spinner-size: 14px;
+  --spinner-width: 2px;
+  --spinner-duration: 800ms;
+
   /* Sleeping tabs */
   --sleeping-opacity: 0.55;
 

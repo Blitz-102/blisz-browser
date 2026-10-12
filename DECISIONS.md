@@ -2,6 +2,45 @@
 
 Newest at the top. Each entry: what was chosen, what else was considered, why, and when to revisit.
 
+## 2026-10-12: Constraints from the step 2b security reviews
+- Chosen:
+  - Never add `protocol.handle` to `persist:main` without revisiting `src/main/favicon.ts`. `session.fetch` allows any protocol, and only `isWebUrl` stands in the way.
+  - (Step 2f, dialogs) Check whether `alert()`, `confirm()` or `prompt()` from a detached background tab shows over the active tab. If it does, switch to that tab first, or hold the dialog until it is active.
+  - Accepted residual risks:
+    - favicon GETs to LAN or loopback hosts that a page names (no cookies; the result is only shown as an image);
+    - ICO entries are checked only by their directory sizes;
+    - an https page can name an http favicon.
+- Alternatives considered: host filtering for favicons (DNS rebinding defeats it).
+- Why: each limits what an untrusted page can make main or the trusted UI do.
+- Revisit if: the ad blocker arrives (it can cover favicon requests), or a decoder CVE affects PNG, GIF, ICO or SVG.
+- Status: settled
+
+## 2026-10-12: Favicons fetched in main, shown as data: URLs
+- Chosen:
+  - **Fetching:** main fetches favicons with the page session's `fetch`: `credentials: 'omit'`, `bypassCustomProtocolHandlers`, http(s) only, at most 8 candidates, a 5 s timeout, one fetch per tab (aborted when superseded), 64 KB cap.
+  - **Formats:** PNG, ICO and GIF must have magic bytes that match their type and be at most 256 px. JPEG and WebP are refused.
+  - **SVG** is used only when no raster candidate validates (user decision).
+  - **In the UI:** the image arrives as a `data:` URL, decoded in the sandboxed UI renderer.
+- Alternatives considered:
+  - the UI loading favicon URLs itself (breaks the "no remote content in trusted views" rule and the CSP);
+  - decoding with `nativeImage` in main (unsandboxed);
+  - always or never using SVG.
+- Why: the page chooses the bytes, so they are checked before they reach the privileged UI. Leaving out cookies stops a page using favicons to send credentialed GETs to other sites.
+- Revisit if: decoding can move to the page's own renderer, or the UI starts holding secrets (the vault in Phase 4); then re-check this exposure.
+- Status: settled
+
+## 2026-10-12: Tab behaviour in step 2b
+- Chosen:
+  - **Views:** only the active tab's view is attached. Others are detached with `removeChildView`, which Chromium treats as hidden and throttles. The user confirmed CPU drops when a page is hidden.
+  - **Closing:** closing a tab activates the next one, else the previous one. Closing the last tab leaves a blank tab (user decision).
+  - **Duplicate** exists as IPC only for now. It loads the source's URL without its history.
+  - **Updates:** `order` is authoritative in `TabsUpdate`.
+  - **Labels:** memory-panel labels are `Tab: <titles>`, with bidi controls stripped.
+- Alternatives considered: `setVisible(false)` for hidden tabs (not confirmed to make Chromium treat the page as hidden).
+- Why: PLAN 4.1 and 5.2. Playwright can't observe `visibilityState`, so a manual CPU check confirmed it.
+- Revisit if: tab sleeping arrives (Phase 3), or a UI for duplicate is wanted (the context menu, 2e).
+- Status: settled
+
 ## 2026-10-12: Page user agent, Chrome UA plus a Blisz token
 - Chosen: `persist:main` uses Electron's Chrome UA with the `Electron/` and npm app-name tokens removed and `Blisz/<version>` appended (built explicitly in `src/main/tabs.ts`).
 - Alternatives considered:

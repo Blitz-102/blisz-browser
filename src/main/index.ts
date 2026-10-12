@@ -14,7 +14,7 @@ import { isWebUrl } from '../shared/url';
 import { runBench } from './bench';
 import { addTrustedUi, handleFromUi, UI_URL } from './ipc';
 import { getMetrics } from './metrics';
-import { initTabs, isPageContents } from './tabs';
+import { getTabProcessLabels, initTabs, isPageContents } from './tabs';
 
 // Native caption buttons via titleBarOverlay (PLAN 4.6); colours come from tokens.css.
 // Fallbacks for --color-frame and --color-text, used only if reading them from the UI fails.
@@ -222,7 +222,7 @@ app.whenReady().then(() => {
   session.defaultSession.protocol.handle('blisz', serveUiFiles);
   handleFromUi('app:get-version', () => app.getVersion());
   const ui = createWindow();
-  handleFromUi('metrics:get', () => getMetrics(ui.getOSProcessId()));
+  handleFromUi('metrics:get', () => getMetrics(ui.getOSProcessId(), getTabProcessLabels()));
   // `npm run bench:memory` passes --bench; never honoured in a packaged app.
   if (!app.isPackaged && process.argv.includes('--bench')) {
     runBench(ui);

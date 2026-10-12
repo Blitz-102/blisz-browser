@@ -15,9 +15,13 @@ export function diffTabInfo(prev: TabInfo | undefined, next: TabInfo): Partial<T
   return changed ? changes : null;
 }
 
+// Tabs follow `order`; a tab missing from the state is created from its (full) update.
 export function applyTabsUpdate(state: TabsState, update: TabsUpdate): TabsState {
-  return {
-    activeId: update.activeId,
-    tabs: state.tabs.map((tab) => ({ ...tab, ...update.tabs[tab.id] })),
-  };
+  const known = new Map(state.tabs.map((tab) => [tab.id, tab]));
+  const tabs: TabInfo[] = [];
+  for (const id of update.order) {
+    const merged = { ...known.get(id), ...update.tabs[id] } as TabInfo;
+    if (merged.id === id) tabs.push(merged);
+  }
+  return { activeId: update.activeId, order: tabs.map((tab) => tab.id), tabs };
 }

@@ -131,25 +131,7 @@
   overflow: auto;
 }
 
-.placeholder {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  align-items: center;
-  max-width: 100%;
-  padding: 0 var(--space-3);
-  text-align: center;
-  /* Phase 2 titles and URLs come from pages and can be one long unbroken string. */
-  overflow-wrap: anywhere;
-}
-
 .placeholderTitle {
   margin: 0;
   font-size: var(--font-size-md);
-}
-
-.placeholderUrl {
-  margin: 0;
-  font-family: var(--font-mono);
-  font-size: var(--font-size-sm);
 }

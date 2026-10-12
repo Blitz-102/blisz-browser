@@ -16,6 +16,11 @@
   color: var(--color-text-muted);
 }
 
+/* Process labels contain page titles. */
+.table td:first-child {
+  unicode-bidi: isolate;
+}
+
 /* Figures: right-aligned with equal-width digits so columns don't jitter on refresh. */
 .table td:nth-child(n + 3),
 .table th:nth-child(n + 3) {

@@ -1,10 +1,11 @@
 import { app } from 'electron';
 import type { MetricsResult } from '../shared/metrics';
 
-// Phase 2 will also label page processes by tab (PLAN 5.1).
-export function getMetrics(uiPid: number): MetricsResult {
+// tabLabels maps a page process id to its tab label (PLAN 5.1).
+export function getMetrics(uiPid: number, tabLabels: Map<number, string>): MetricsResult {
   const processes = app.getAppMetrics().map((metric) => {
-    const label = metric.pid === uiPid ? 'UI' : (metric.name ?? metric.type);
+    const label =
+      metric.pid === uiPid ? 'UI' : (tabLabels.get(metric.pid) ?? metric.name ?? metric.type);
     return {
       pid: metric.pid,
       type: metric.type,

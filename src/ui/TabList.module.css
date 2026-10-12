@@ -66,6 +66,38 @@
   font-weight: var(--font-weight-strong);
 }
 
+.faviconImage {
+  flex: none;
+  width: var(--favicon-size);
+  height: var(--favicon-size);
+  border-radius: var(--radius-sm);
+  object-fit: contain;
+}
+
+/* Shown only while a tab is loading, so nothing animates otherwise. */
+.spinner {
+  flex: none;
+  width: var(--spinner-size);
+  height: var(--spinner-size);
+  border: var(--spinner-width) solid var(--color-border);
+  border-top-color: var(--color-accent);
+  border-radius: 50%;
+  animation: spin var(--spinner-duration) linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation: none;
+  }
+}
+
+/* Not used yet: Phase 3 marks sleeping tabs with these. */
 .faviconSleeping {
   border: var(--border-width) dashed var(--color-text-muted);
   opacity: var(--sleeping-opacity);
@@ -73,6 +105,7 @@
 
 .title {
   min-width: 0;
+  unicode-bidi: isolate; /* page titles can be right-to-left; keep them from reordering neighbours */
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

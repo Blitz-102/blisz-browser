@@ -12,19 +12,15 @@ import {
   XIcon,
 } from './icons/icons';
 import { MemoryPanel } from './MemoryPanel';
-import { initialTabs, type Tab } from './mockData';
 import { PinnedSites } from './PinnedSites';
 import { TabList } from './TabList';
 
 export function App() {
   const [memoryOpen, setMemoryOpen] = useState(false);
-  const [tabs, setTabs] = useState(initialTabs);
-  const activeTab = tabs.find((tab) => tab.state === 'active');
-
-  // The real tab state comes from main. The mock tabs above are replaced in the next step.
+  // The tab state comes from main, which owns the tabs.
   const [tabsState, setTabsState] = useState<TabsState | null>(null);
-  const realTab = tabsState?.tabs.find((tab) => tab.id === tabsState.activeId);
-  const isBlank = realTab?.url === '';
+  const activeTab = tabsState?.tabs.find((tab) => tab.id === tabsState.activeId);
+  const isBlank = activeTab?.url === '';
   // Text the user is typing in the address field; null shows the tab's URL.
   const [draft, setDraft] = useState<string | null>(null);
   // What was just submitted, shown until the tab reports its new URL so the field doesn't flicker.
@@ -40,12 +36,20 @@ export function App() {
   }, []);
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: the URL and loading state are the triggers
-  useEffect(() => setSubmitted(null), [realTab?.url, realTab?.isLoading]);
+  useEffect(() => setSubmitted(null), [activeTab?.url, activeTab?.isLoading]);
 
-  // A blank tab starts with the address field focused.
+  // Switching tabs drops what was typed or submitted for the previous one.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: the active tab is the trigger
+  useEffect(() => {
+    setDraft(null);
+    setSubmitted(null);
+  }, [tabsState?.activeId]);
+
+  // A blank tab starts with the address field focused (main gives the UI focus when it activates one).
+  // biome-ignore lint/correctness/useExhaustiveDependencies: switching between two blank tabs must focus too
   useEffect(() => {
     if (isBlank) addressRef.current?.focus();
-  }, [isBlank]);
+  }, [isBlank, tabsState?.activeId]);
 
   // Tell main where the page goes. While the memory panel is open it takes the page's place.
   useEffect(() => {
@@ -64,43 +68,24 @@ export function App() {
   }, [memoryOpen]);
 
   function submitAddress() {
-    if (!realTab || draft === null) return;
+    if (!activeTab || draft === null) return;
     setMemoryOpen(false);
     const text = toNavigableUrl(draft);
     if (text !== '') setSubmitted(text);
-    window.bliss.navigateTab(realTab.id, draft).then((started) => {
+    window.bliss.navigateTab(activeTab.id, draft).then((started) => {
       if (!started) setSubmitted(null);
     });
     setDraft(null);
   }
 
-  // A tab that becomes active wakes up; the previously active one goes back to normal.
-  function selectTab(id: string) {
-    setTabs(
-      tabs.map((tab): Tab => {
-        if (tab.id === id) return { ...tab, state: 'active' };
-        return tab.state === 'active' ? { ...tab, state: 'normal' } : tab;
-      }),
-    );
-  }
-
-  function closeTab(id: string) {
-    const index = tabs.findIndex((tab) => tab.id === id);
-    const remaining = tabs.filter((tab) => tab.id !== id);
-    if (id === activeTab?.id && remaining.length > 0) {
-      const neighbour = remaining[Math.min(index, remaining.length - 1)];
-      setTabs(remaining.map((tab): Tab => (tab === neighbour ? { ...tab, state: 'active' } : tab)));
-    } else {
-      setTabs(remaining);
-    }
+  function selectTab(id: number) {
+    setMemoryOpen(false);
+    window.bliss.activateTab(id);
   }
 
   function addTab() {
-    const newTab: Tab = { id: crypto.randomUUID(), title: 'New tab', url: '', state: 'active' };
-    setTabs([
-      ...tabs.map((tab): Tab => (tab.state === 'active' ? { ...tab, state: 'normal' } : tab)),
-      newTab,
-    ]);
+    setMemoryOpen(false);
+    window.bliss.createTab();
   }
 
   return (
@@ -111,8 +96,8 @@ export function App() {
             type="button"
             className={styles.iconButton}
             aria-label="Back"
-            disabled={!realTab?.canGoBack}
-            onClick={() => realTab && window.bliss.tabGo(realTab.id, 'back')}
+            disabled={!activeTab?.canGoBack}
+            onClick={() => activeTab && window.bliss.tabGo(activeTab.id, 'back')}
           >
             <ArrowLeftIcon />
           </button>
@@ -120,20 +105,20 @@ export function App() {
             type="button"
             className={styles.iconButton}
             aria-label="Forward"
-            disabled={!realTab?.canGoForward}
-            onClick={() => realTab && window.bliss.tabGo(realTab.id, 'forward')}
+            disabled={!activeTab?.canGoForward}
+            onClick={() => activeTab && window.bliss.tabGo(activeTab.id, 'forward')}
           >
             <ArrowRightIcon />
           </button>
           <button
             type="button"
             className={styles.iconButton}
-            aria-label={realTab?.isLoading ? 'Stop' : 'Reload'}
+            aria-label={activeTab?.isLoading ? 'Stop' : 'Reload'}
             onClick={() =>
-              realTab && window.bliss.tabGo(realTab.id, realTab.isLoading ? 'stop' : 'reload')
+              activeTab && window.bliss.tabGo(activeTab.id, activeTab.isLoading ? 'stop' : 'reload')
             }
           >
-            {realTab?.isLoading ? <XIcon /> : <RotateCwIcon />}
+            {activeTab?.isLoading ? <XIcon /> : <RotateCwIcon />}
           </button>
         </div>
         <div className={styles.address}>
@@ -143,7 +128,7 @@ export function App() {
             aria-label="Address"
             placeholder="Search or enter address"
             ref={addressRef}
-            value={draft ?? submitted ?? realTab?.url ?? ''}
+            value={draft ?? submitted ?? activeTab?.url ?? ''}
             spellCheck={false}
             onChange={(event) => setDraft(event.target.value)}
             onFocus={(event) => event.currentTarget.select()}
@@ -162,7 +147,13 @@ export function App() {
           </button>
         </div>
         <PinnedSites />
-        <TabList tabs={tabs} onSelect={selectTab} onClose={closeTab} onNewTab={addTab} />
+        <TabList
+          tabs={tabsState?.tabs ?? []}
+          activeId={tabsState?.activeId ?? null}
+          onSelect={selectTab}
+          onClose={(id) => window.bliss.closeTab(id)}
+          onNewTab={addTab}
+        />
         <button
           type="button"
           className={styles.memoryToggle}
@@ -177,15 +168,7 @@ export function App() {
         {memoryOpen ? (
           <MemoryPanel />
         ) : (
-          isBlank &&
-          (activeTab ? (
-            <div className={styles.placeholder}>
-              <p className={styles.placeholderTitle}>{activeTab.title}</p>
-              <p className={styles.placeholderUrl}>{activeTab.url}</p>
-            </div>
-          ) : (
-            <p className={styles.placeholderTitle}>No tab open</p>
-          ))
+          isBlank && <p className={styles.placeholderTitle}>New tab</p>
         )}
       </main>
     </div>

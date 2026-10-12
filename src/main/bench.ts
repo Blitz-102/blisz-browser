@@ -1,5 +1,6 @@
 import { app, type WebContents } from 'electron';
 import { getMetrics } from './metrics';
+import { getTabProcessLabels } from './tabs';
 
 const SETTLE_MS = 10_000;
 const SAFETY_TIMEOUT_MS = 60_000;
@@ -23,7 +24,10 @@ export function runBench(ui: WebContents): void {
     app.getAppMetrics();
     setTimeout(() => {
       try {
-        const { processes, totalPrivateKB, totalWorkingSetKB } = getMetrics(ui.getOSProcessId());
+        const { processes, totalPrivateKB, totalWorkingSetKB } = getMetrics(
+          ui.getOSProcessId(),
+          getTabProcessLabels(),
+        );
         console.log(`Memory after ${SETTLE_MS / 1000}s settle (MB)`);
         console.table(
           processes.map((p) => ({

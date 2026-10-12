@@ -8,6 +8,10 @@ contextBridge.exposeInMainWorld('bliss', {
   getVersion: (): Promise<string> => ipcRenderer.invoke('app:get-version'),
   getMetrics: (): Promise<MetricsResult> => ipcRenderer.invoke('metrics:get'),
   getTabsState: (): Promise<TabsState> => ipcRenderer.invoke('tabs:get-state'),
+  createTab: (): Promise<number> => ipcRenderer.invoke('tabs:create'),
+  closeTab: (id: number): Promise<void> => ipcRenderer.invoke('tabs:close', id),
+  activateTab: (id: number): Promise<void> => ipcRenderer.invoke('tabs:activate', id),
+  duplicateTab: (id: number): Promise<number> => ipcRenderer.invoke('tabs:duplicate', id),
   navigateTab: (id: number, input: string): Promise<boolean> =>
     ipcRenderer.invoke('tab:navigate', id, input),
   tabGo: (id: number, action: TabAction): Promise<void> => ipcRenderer.invoke('tab:go', id, action),

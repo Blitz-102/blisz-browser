@@ -1,69 +1,73 @@
 import { useEffect, useRef } from 'react';
+import type { TabInfo } from '../shared/tabs';
 import { PlusIcon, XIcon } from './icons/icons';
-import type { Tab } from './mockData';
 import styles from './TabList.module.css';
 
 interface TabListProps {
-  tabs: Tab[];
-  onSelect: (id: string) => void;
-  onClose: (id: string) => void;
+  tabs: TabInfo[];
+  activeId: number | null;
+  onSelect: (id: number) => void;
+  onClose: (id: number) => void;
   onNewTab: () => void;
 }
 
-export function TabList({ tabs, onSelect, onClose, onNewTab }: TabListProps) {
-  const listRef = useRef<HTMLUListElement>(null);
-  const focusAfterClose = useRef(false);
+// Titles and URLs come from web pages; they are only ever rendered as text.
+function tabLabel(tab: TabInfo): string {
+  if (tab.title !== '') return tab.title;
+  if (URL.canParse(tab.url)) return new URL(tab.url).host || tab.url;
+  return 'New tab';
+}
 
-  // Closing a tab removes the focused button, so hand focus to the active tab (or the list when empty).
-  // biome-ignore lint/correctness/useExhaustiveDependencies: runs after each tabs change, but only acts once a close was requested
+export function TabList({ tabs, activeId, onSelect, onClose, onNewTab }: TabListProps) {
+  const listRef = useRef<HTMLUListElement>(null);
+  const closingId = useRef<number | null>(null);
+
+  // Closing a tab removes the focused button, so once that tab is gone hand focus to the active tab.
   useEffect(() => {
-    if (!focusAfterClose.current) return;
-    focusAfterClose.current = false;
+    if (closingId.current === null || tabs.some((tab) => tab.id === closingId.current)) return;
+    closingId.current = null;
     const activeButton = listRef.current?.querySelector<HTMLElement>('[aria-current="page"]');
     (activeButton ?? listRef.current)?.focus();
   }, [tabs]);
 
   return (
     <ul ref={listRef} className={styles.list} aria-label="Open tabs" tabIndex={-1}>
-      {tabs.map((tab) => (
-        <li
-          key={tab.id}
-          className={tab.state === 'active' ? `${styles.row} ${styles.rowActive}` : styles.row}
-        >
-          <button
-            type="button"
-            className={styles.select}
-            aria-current={tab.state === 'active' ? 'page' : undefined}
-            onClick={() => onSelect(tab.id)}
-          >
-            <span
-              className={
-                tab.state === 'sleeping'
-                  ? `${styles.favicon} ${styles.faviconSleeping}`
-                  : styles.favicon
-              }
-              aria-hidden="true"
+      {tabs.map((tab) => {
+        const label = tabLabel(tab);
+        const isActive = tab.id === activeId;
+        return (
+          <li key={tab.id} className={isActive ? `${styles.row} ${styles.rowActive}` : styles.row}>
+            <button
+              type="button"
+              className={styles.select}
+              aria-current={isActive ? 'page' : undefined}
+              aria-busy={tab.isLoading}
+              onClick={() => onSelect(tab.id)}
             >
-              {tab.title[0]}
-            </span>
-            <span className={tab.state === 'sleeping' ? styles.titleSleeping : styles.title}>
-              {tab.title}
-              {tab.state === 'sleeping' && <span className="visually-hidden">, sleeping</span>}
-            </span>
-          </button>
-          <button
-            type="button"
-            className={styles.close}
-            aria-label={`Close ${tab.title}`}
-            onClick={() => {
-              focusAfterClose.current = true;
-              onClose(tab.id);
-            }}
-          >
-            <XIcon />
-          </button>
-        </li>
-      ))}
+              {tab.favicon ? (
+                <img className={styles.faviconImage} src={tab.favicon} alt="" />
+              ) : (
+                <span className={styles.favicon} aria-hidden="true">
+                  {Array.from(label)[0]?.toUpperCase()}
+                </span>
+              )}
+              <span className={styles.title}>{label}</span>
+              {tab.isLoading && <span className={styles.spinner} aria-hidden="true" />}
+            </button>
+            <button
+              type="button"
+              className={styles.close}
+              aria-label={`Close ${label}`}
+              onClick={() => {
+                closingId.current = tab.id;
+                onClose(tab.id);
+              }}
+            >
+              <XIcon />
+            </button>
+          </li>
+        );
+      })}
       <li className={styles.row}>
         <button type="button" className={styles.select} onClick={onNewTab}>
           <PlusIcon />

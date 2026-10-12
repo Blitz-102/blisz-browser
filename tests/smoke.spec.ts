@@ -7,6 +7,7 @@ import {
   type Page,
   test,
 } from '@playwright/test';
+import type { TabsState } from '../src/shared/tabs';
 
 function launch(): Promise<ElectronApplication> {
   return electron.launch({
@@ -65,43 +66,41 @@ test('sidebar renders and the memory panel lists processes', async () => {
     await expect(pinned.getByRole('button')).toHaveCount(8);
     await expect(pinned.getByRole('button', { name: 'GitHub' })).toBeVisible();
 
-    // Initial state: mock data's active tab, memory panel closed. The native caption buttons are
+    // Initial state: one blank tab, memory panel closed. The native caption buttons are
     // drawn by Electron outside the webContents, so they are not in this screenshot (expected).
     await page.screenshot({ path: 'test-results/sidebar-1280x800.png', scale: 'css' });
 
     const memory = page.getByRole('button', { name: 'Memory' });
     const pageArea = page.getByRole('main');
+    const rows = page.getByRole('list', { name: 'Open tabs' }).getByRole('listitem');
     await expect(memory).toHaveAttribute('aria-pressed', 'false');
-    await expect(pageArea).toContainText('GitHub: bliss-browser');
-
-    // Clicking a mock tab moves aria-current to it. The address belongs to the real tab (blank).
-    const address = page.getByRole('textbox', { name: 'Address' });
+    await expect(pageArea).toContainText('New tab');
     const active = page.locator('[aria-current="page"]');
-    await expect(active).toContainText('GitHub: bliss-browser');
-    await page.getByRole('button', { name: 'Stack Overflow', exact: true }).click();
-    await expect(active).toContainText('Stack Overflow');
-    await expect(pageArea).toContainText('Stack Overflow');
-    await expect(address).toHaveValue('');
+    await expect(active).toContainText('New tab');
+    await expect(page.getByRole('textbox', { name: 'Address' })).toHaveValue('');
+    await expect(rows).toHaveCount(2);
 
-    // Sleeping tabs say so to screen readers.
-    await expect(page.getByRole('button', { name: /^Weather ?, sleeping$/ })).toBeVisible();
+    // The "New tab" button is the list's last item, after the tab rows.
+    await rows.last().getByRole('button').click();
+    await expect(rows).toHaveCount(3);
 
     // Closing by keyboard: the close button shows on focus, and focus lands on the active tab.
-    const close = page.getByRole('button', { name: 'Close Weather' });
+    const close = page.getByRole('button', { name: 'Close New tab' }).first();
     await close.focus();
     await expect(close).toBeVisible();
     await expect(close).toHaveCSS('opacity', '1');
     await page.keyboard.press('Enter');
-    await expect(page.getByRole('button', { name: 'Weather', exact: true })).toHaveCount(0);
+    await expect(rows).toHaveCount(2);
     await expect(active).toBeFocused();
 
-    // Closing the active tab makes its neighbour active.
-    await page.getByRole('button', { name: 'Close Stack Overflow' }).click();
-    await expect(active).toContainText('Inbox (3)');
-
-    await page.getByRole('button', { name: 'New tab', exact: true }).click();
+    // Closing the last tab leaves a new blank one.
+    const lastTabId = (await page.evaluate<TabsState>('window.bliss.getTabsState()')).activeId;
+    await page.getByRole('button', { name: 'Close New tab' }).click();
+    await expect
+      .poll(async () => (await page.evaluate<TabsState>('window.bliss.getTabsState()')).activeId)
+      .not.toBe(lastTabId);
+    await expect(rows).toHaveCount(2);
     await expect(active).toContainText('New tab');
-    await expect(page.getByRole('button', { name: 'New tab', exact: true })).toHaveCount(2);
 
     await memory.click();
     await expect(memory).toHaveAttribute('aria-pressed', 'true');
@@ -184,6 +183,107 @@ test('the address field loads pages, goes back and refuses file URLs', async () 
       await address.press('Enter');
       await expect.poll(pageTitle).toBe('Fixture home');
       await expect(address).toHaveValue(home);
+    } finally {
+      await app.close();
+    }
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
+const FAVICON_PNG = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
+  'base64',
+);
+
+test('tabs: create, switch, hide, close, favicon and duplicate', async () => {
+  const server = createServer((request, response) => {
+    if (request.url === '/favicon.png') {
+      response.setHeader('Content-Type', 'image/png');
+      response.end(FAVICON_PNG);
+      return;
+    }
+    response.setHeader('Content-Type', 'text/html');
+    if (request.url === '/next') {
+      response.end('<title>Fixture next</title><p>Second page</p>');
+    } else if (request.url === '/icon') {
+      response.end('<title>Fixture icon</title><link rel="icon" href="/favicon.png">');
+    } else {
+      response.end('<title>Fixture home</title><p>First page</p>');
+    }
+  });
+  try {
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const home = `http://127.0.0.1:${(server.address() as AddressInfo).port}/`;
+    const app = await launch();
+    try {
+      const ui = await findUi(app);
+      const address = ui.getByRole('textbox', { name: 'Address' });
+      const tabList = ui.getByRole('list', { name: 'Open tabs' });
+      const active = ui.locator('[aria-current="page"]');
+      const newTab = tabList.getByRole('listitem').last().getByRole('button');
+
+      // URLs of the page views currently attached to the window (the UI view is not a page).
+      const attachedUrls = () =>
+        app.evaluate(({ BaseWindow }) =>
+          (BaseWindow.getAllWindows()[0]?.contentView.children ?? [])
+            .map((view) => (view as Electron.WebContentsView).webContents.getURL())
+            .filter((url) => url.startsWith('http')),
+        );
+      const getState = () => ui.evaluate<TabsState>('window.bliss.getTabsState()');
+
+      await address.fill(home);
+      await address.press('Enter');
+      await expect(active).toContainText('Fixture home');
+
+      await newTab.click();
+      await expect(address).toBeFocused();
+      await address.fill(`${home}next`);
+      await address.press('Enter');
+      await expect(active).toContainText('Fixture next');
+      await expect(tabList.getByRole('listitem')).toHaveCount(3);
+
+      // Switching back attaches the first page and detaches the second, which Chromium then hides.
+      // document.visibilityState can't be asserted here: Playwright keeps every page it is attached to "visible".
+      await ui.getByRole('button', { name: 'Fixture home', exact: true }).click();
+      await expect(active).toContainText('Fixture home');
+      await expect.poll(attachedUrls).toEqual([home]);
+
+      // Page processes are labelled by tab in the memory panel.
+      await ui.getByRole('button', { name: 'Memory' }).click();
+      const table = ui.getByRole('table', { name: 'Memory by process' });
+      await expect(table.getByRole('cell', { name: /^Tab: .*Fixture next/ })).toBeVisible();
+      await ui.getByRole('button', { name: 'Memory' }).click();
+
+      // Closing the active tab activates its neighbour.
+      await ui.getByRole('button', { name: 'Close Fixture home' }).click();
+      await expect(active).toContainText('Fixture next');
+      await expect.poll(attachedUrls).toEqual([`${home}next`]);
+      await expect(tabList.getByRole('listitem')).toHaveCount(2);
+
+      // A favicon from the page ends up in the tab row as a data: URL.
+      await address.fill(`${home}icon`);
+      await address.press('Enter');
+      await expect(active).toContainText('Fixture icon');
+      await expect(tabList.locator('img')).toHaveAttribute('src', /^data:image\/png;base64,/);
+
+      // Duplicate (IPC only, no UI yet): a new tab right after the source, with the same URL.
+      const { activeId } = await getState();
+      const copyId = await ui.evaluate<number>(`window.bliss.duplicateTab(${activeId})`);
+      await expect.poll(async () => (await getState()).order).toEqual([activeId, copyId]);
+      await expect(address).toHaveValue(`${home}icon`);
+      expect((await getState()).activeId).toBe(copyId);
+
+      // Closing every tab leaves one blank tab.
+      const oldOrder = (await getState()).order;
+      await ui.evaluate(
+        `(async () => { for (const id of ${JSON.stringify(oldOrder)}) await window.bliss.closeTab(id); })()`,
+      );
+      await expect.poll(async () => (await getState()).tabs.map((tab) => tab.url)).toEqual(['']);
+      expect(oldOrder).not.toContain((await getState()).activeId);
+      await expect(address).toHaveValue('');
+      await expect(tabList.getByRole('listitem')).toHaveCount(2);
     } finally {
       await app.close();
     }
