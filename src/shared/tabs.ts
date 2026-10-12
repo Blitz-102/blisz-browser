@@ -6,6 +6,8 @@ export interface TabInfo {
   canGoBack: boolean;
   canGoForward: boolean;
   favicon: string | null; // a data: URL built by main, never a remote URL
+  blockedPopups: number; // popups denied since the last main-frame navigation
+  zoom: number; // zoom factor, 1 = 100%
 }
 
 export interface TabsState {
@@ -34,4 +36,16 @@ export interface PageArea {
   height: number;
   radius: number;
   hidden: boolean;
+}
+
+// Find-in-page result for the active tab, from the final `found-in-page` event.
+export interface FindResult {
+  tabId: number;
+  activeMatchOrdinal: number;
+  matches: number;
+}
+
+export interface FindOptions {
+  forward: boolean;
+  findNext: boolean; // false starts a new search, true moves to the next match
 }

@@ -11,8 +11,18 @@ interface Window {
     duplicateTab(id: number): Promise<number>;
     navigateTab(id: number, input: string): Promise<boolean>;
     tabGo(id: number, action: import('../shared/tabs').TabAction): Promise<void>;
+    resetZoom(id: number): Promise<void>;
+    findQuery(
+      id: number,
+      text: string,
+      options: import('../shared/tabs').FindOptions,
+    ): Promise<void>;
+    findStop(id: number, focusPage: boolean): Promise<void>;
     setPageArea(area: import('../shared/tabs').PageArea): Promise<void>;
     onTabsUpdate(callback: (update: import('../shared/tabs').TabsUpdate) => void): () => void;
     onFocusAddress(callback: () => void): () => void;
+    onOpenFind(callback: () => void): () => void;
+    onCloseFind(callback: () => void): () => void;
+    onFindResult(callback: (result: import('../shared/tabs').FindResult) => void): () => void;
   };
 }

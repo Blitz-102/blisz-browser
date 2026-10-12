@@ -81,3 +81,19 @@ export function ActivityIcon() {
     </svg>
   );
 }
+
+export function ChevronUpIcon() {
+  return (
+    <svg {...svgProps} aria-hidden="true">
+      <path d="m18 15-6-6-6 6" />
+    </svg>
+  );
+}
+
+export function ChevronDownIcon() {
+  return (
+    <svg {...svgProps} aria-hidden="true">
+      <path d="m6 9 6 6 6-6" />
+    </svg>
+  );
+}

@@ -3,6 +3,7 @@ import { toNavigableUrl } from '../shared/address';
 import type { TabsState } from '../shared/tabs';
 import { applyTabsUpdate } from '../shared/tabsUpdate';
 import styles from './App.module.css';
+import { FindStrip } from './FindStrip';
 import {
   ActivityIcon,
   ArrowLeftIcon,
@@ -27,6 +28,8 @@ export function App() {
   const [submitted, setSubmitted] = useState<string | null>(null);
   const addressRef = useRef<HTMLInputElement>(null);
   const pageRef = useRef<HTMLElement>(null);
+  const [findOpen, setFindOpen] = useState(false);
+  const [findRequest, setFindRequest] = useState(0); // each Ctrl+F focuses the strip's input
 
   useEffect(() => {
     window.bliss.getTabsState().then(setTabsState);
@@ -61,6 +64,24 @@ export function App() {
     [],
   );
 
+  // Ctrl+F is handled in main, which also closes the strip on tab switches and navigation.
+  // The memory panel takes the page's place, so there is nothing to search there.
+  useEffect(() => {
+    const unsubscribeOpen = window.bliss.onOpenFind(() => {
+      if (memoryOpen) {
+        if (activeTab) window.bliss.findStop(activeTab.id, false); // main already counted it as open
+        return;
+      }
+      setFindOpen(true);
+      setFindRequest((request) => request + 1);
+    });
+    const unsubscribeClose = window.bliss.onCloseFind(() => setFindOpen(false));
+    return () => {
+      unsubscribeOpen();
+      unsubscribeClose();
+    };
+  }, [memoryOpen, activeTab]);
+
   // Tell main where the page goes. While the memory panel is open it takes the page's place.
   useEffect(() => {
     const page = pageRef.current;
@@ -86,6 +107,16 @@ export function App() {
       if (!started) setSubmitted(null);
     });
     setDraft(null);
+  }
+
+  function closeFind(focusPage = true) {
+    setFindOpen(false);
+    if (activeTab) window.bliss.findStop(activeTab.id, focusPage);
+  }
+
+  function toggleMemory() {
+    if (!memoryOpen && findOpen) closeFind(false); // the UI keeps the keyboard
+    setMemoryOpen(!memoryOpen);
   }
 
   function selectTab(id: number) {
@@ -152,10 +183,21 @@ export function App() {
               }
             }}
           />
+          {activeTab && activeTab.zoom !== 1 && (
+            <button
+              type="button"
+              className={styles.zoomButton}
+              aria-label="Reset zoom"
+              onClick={() => window.bliss.resetZoom(activeTab.id)}
+            >
+              {Math.round(activeTab.zoom * 100)}%
+            </button>
+          )}
           <button type="button" className={styles.iconButton} aria-label="Ad blocker">
             <ShieldIcon />
           </button>
         </div>
+        {activeTab && activeTab.blockedPopups > 0 && <p className={styles.note}>Popup blocked</p>}
         <PinnedSites />
         <TabList
           tabs={tabsState?.tabs ?? []}
@@ -168,19 +210,24 @@ export function App() {
           type="button"
           className={styles.memoryToggle}
           aria-pressed={memoryOpen}
-          onClick={() => setMemoryOpen(!memoryOpen)}
+          onClick={toggleMemory}
         >
           <ActivityIcon />
           Memory
         </button>
       </nav>
-      <main ref={pageRef} className={styles.page}>
-        {memoryOpen ? (
-          <MemoryPanel />
-        ) : (
-          isBlank && <p className={styles.placeholderTitle}>New tab</p>
+      <div className={styles.pageColumn}>
+        {findOpen && activeTab && (
+          <FindStrip tabId={activeTab.id} focusRequest={findRequest} onClose={() => closeFind()} />
         )}
-      </main>
+        <main ref={pageRef} className={styles.page}>
+          {memoryOpen ? (
+            <MemoryPanel />
+          ) : (
+            isBlank && <p className={styles.placeholderTitle}>New tab</p>
+          )}
+        </main>
+      </div>
     </div>
   );
 }

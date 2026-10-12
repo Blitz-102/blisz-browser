@@ -26,6 +26,11 @@ const TITLE_BAR_HEIGHT = 40;
 const OPAQUE_RGB = /^rgb\(\d{1,3}, \d{1,3}, \d{1,3}\)$/;
 const READ_COLORS_TIMEOUT_MS = 2000;
 
+// Smoke tests use a throwaway profile so they never touch the real one. Ignored when packaged.
+if (!app.isPackaged && process.env.BLISZ_USER_DATA) {
+  app.setPath('userData', process.env.BLISZ_USER_DATA);
+}
+
 // A debugging port lets malware (infostealers) read cookies and drive the UI over CDP. Unpackaged
 // builds keep it because Playwright needs it.
 if (
@@ -100,7 +105,7 @@ function isAllowedFrameUrl(url: string): boolean {
 }
 
 // Baseline for EVERY webContents; the UI view stays locked. Page views get http(s) navigation
-// through isNavigationAllowed; popups stay denied until the popup step.
+// through isNavigationAllowed; popups are decided per page view in tabs.ts.
 app.on('web-contents-created', (_event, contents) => {
   contents.setWindowOpenHandler(() => ({ action: 'deny' }));
   contents.on('will-attach-webview', (event) => event.preventDefault());

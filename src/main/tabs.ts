@@ -1,6 +1,22 @@
-import { app, type BaseWindow, session, type WebContents, WebContentsView } from 'electron';
+import {
+  app,
+  type BaseWindow,
+  type HandlerDetails,
+  session,
+  type WebContents,
+  WebContentsView,
+  type WindowOpenHandlerResponse,
+} from 'electron';
 import { toNavigableUrl } from '../shared/address';
-import type { PageArea, TabAction, TabInfo, TabsState, TabsUpdate } from '../shared/tabs';
+import type {
+  FindOptions,
+  FindResult,
+  PageArea,
+  TabAction,
+  TabInfo,
+  TabsState,
+  TabsUpdate,
+} from '../shared/tabs';
 import { diffTabInfo } from '../shared/tabsUpdate';
 import { isWebUrl } from '../shared/url';
 import { fetchFavicon, webFaviconUrls } from './favicon';
@@ -10,6 +26,19 @@ import { matchShortcut, type ShortcutAction } from './shortcuts';
 // The one place the page session is named. The UI view uses the default session, which is the
 // only one that serves blisz://, so web pages can't reach app files.
 const PAGE_PARTITION = 'persist:main';
+// Everything but the partition, which a popup inherits from its opener.
+// No preload; sandbox and isolation are explicit even though the app enables the sandbox globally.
+const PAGE_WEB_PREFERENCES = {
+  sandbox: true,
+  contextIsolation: true,
+  nodeIntegration: false,
+  webSecurity: true,
+  safeDialogs: true,
+  navigateOnDragDrop: false,
+  devTools: true, // allowed for pages even when packaged; only the UI view's DevTools are dev-only
+} satisfies Electron.WebPreferences;
+// Real user input that may start a popup.
+const POPUP_INPUT_TYPES = new Set<string>(['mouseDown', 'keyDown', 'rawKeyDown', 'touchStart']);
 const MAX_INPUT_LENGTH = 32 * 1024;
 const MAX_RADIUS = 64;
 const FLUSH_DELAY_MS = 16;
@@ -18,7 +47,27 @@ const MAX_LABEL_LENGTH = 40;
 const BIDI_CONTROLS = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
 const ACTIONS: readonly string[] = ['back', 'forward', 'reload', 'stop'] satisfies TabAction[];
 
-const REPEATABLE_ACTIONS = new Set<ShortcutAction>(['next-tab', 'previous-tab', 'back', 'forward']);
+const REPEATABLE_ACTIONS = new Set<ShortcutAction>([
+  'next-tab',
+  'previous-tab',
+  'back',
+  'forward',
+  'find-next',
+  'find-previous',
+  'zoom-in',
+  'zoom-out',
+]);
+
+// Popups: only a user-visible opener may open at most POPUP_LIMIT windows per POPUP_WINDOW_MS.
+const POPUP_LIMIT = 2;
+const POPUP_WINDOW_MS = 5000;
+const POPUP_DISPOSITIONS = new Set<string>(['foreground-tab', 'background-tab', 'new-window']);
+const MAX_FIND_LENGTH = 1000;
+// Chrome's zoom steps. Same-origin tabs share one zoom (Chromium's default policy).
+const ZOOM_STEPS = [
+  0.25, 0.33, 0.5, 0.67, 0.75, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4, 5,
+];
+const ZOOM_EPSILON = 0.01;
 
 interface Tab {
   id: number;
@@ -27,6 +76,10 @@ interface Tab {
   faviconKey: string; // the candidates being fetched or already shown, to skip repeated events
   faviconFetch: AbortController | null;
   htmlFullscreen: boolean; // Esc leaves HTML fullscreen, so it must reach the page
+  opener: Tab | null; // the tab that opened this one as a popup
+  recentPopups: number[]; // times this tab opened popups, newest last
+  blockedPopups: number; // reset on main-frame navigation
+  lastInputAt: number; // time of the last real click or key in the page; a popup needs a recent one
 }
 
 // The page area as distances from the window edges, so a window resize can be applied at once.
@@ -50,6 +103,8 @@ let activeId = 0;
 let insets: Insets | null = null;
 let attachedView: WebContentsView | null = null;
 let focusOnAttach = false; // set by a navigation; layout() focuses the page once it is attached
+let findOpen = false; // the UI's find strip is showing for the active tab
+let findText = ''; // the last query, for F3 and Ctrl+G
 let window: BaseWindow;
 let ui: WebContents;
 
@@ -57,27 +112,77 @@ export function isPageContents(contents: WebContents): boolean {
   return pageContents.has(contents);
 }
 
-// No preload; sandbox and isolation are explicit even though the app enables the sandbox globally.
 function createView(): WebContentsView {
-  const view = new WebContentsView({
-    webPreferences: {
-      partition: PAGE_PARTITION,
-      sandbox: true,
-      contextIsolation: true,
-      nodeIntegration: false,
-      webSecurity: true,
-      safeDialogs: true,
-      navigateOnDragDrop: false,
-      devTools: true, // allowed for pages even when packaged; only the UI view's DevTools are dev-only
-    },
+  return new WebContentsView({
+    webPreferences: { partition: PAGE_PARTITION, ...PAGE_WEB_PREFERENCES },
   });
-  pageContents.add(view.webContents);
-  handleShortcuts(view.webContents);
+}
+
+// Per-page setup shared by tabs we create and popups we adopt.
+function attachPage(tab: Tab, view: WebContentsView): void {
+  const contents = view.webContents;
+  tab.view = view;
+  pageContents.add(contents);
+  handleShortcuts(contents);
+  contents.setWindowOpenHandler((details) => handleWindowOpen(tab, details));
+  contents.on('input-event', (_event, input) => {
+    if (POPUP_INPUT_TYPES.has(input.type)) tab.lastInputAt = Date.now();
+  });
   // A link opened from DevTools becomes a tab, web URLs only (never shell.openExternal).
-  view.webContents.on('devtools-open-url', (_event, url) => {
+  contents.on('devtools-open-url', (_event, url) => {
     if (isWebUrl(url)) navigate(createTab(), url);
   });
-  return view;
+  watchPageEvents(tab, contents);
+}
+
+// Popups open as tabs. Blocked ones are counted so the UI can say so.
+function handleWindowOpen(
+  tab: Tab,
+  { url, disposition }: HandlerDetails,
+): WindowOpenHandlerResponse {
+  const now = Date.now();
+  tab.recentPopups = tab.recentPopups.filter((time) => now - time < POPUP_WINDOW_MS);
+  const allowed =
+    (isWebUrl(url) || url === 'about:blank') && // OAuth often opens a blank popup, then navigates it
+    POPUP_DISPOSITIONS.has(disposition) &&
+    tab.id === activeId &&
+    tabs.includes(tab) &&
+    now - tab.lastInputAt < POPUP_WINDOW_MS && // needs a recent real click or key
+    tab.recentPopups.length < POPUP_LIMIT;
+  if (!allowed) {
+    tab.blockedPopups++;
+    queueUpdate(tab.id);
+    return { action: 'deny' };
+  }
+  tab.recentPopups.push(now);
+  tab.lastInputAt = 0; // one gesture opens one popup
+  return {
+    action: 'allow',
+    outlivesOpener: true, // popups are tabs of their own; closing the opener must not destroy them
+    overrideBrowserWindowOptions: { webPreferences: { ...PAGE_WEB_PREFERENCES, zoomFactor: 1 } },
+    createWindow: (options) => {
+      // Electron passes the new window's webContents here (its typings don't list it) when the
+      // popup needs window.opener. Adopting it keeps the opener, which OAuth flows rely on.
+      // Without one (a background tab), we create the view and load the URL ourselves.
+      const { webContents } = options as { webContents?: WebContents };
+      const view = webContents ? new WebContentsView({ webContents }) : createView();
+      if (!webContents) view.webContents.loadURL(url).catch(() => {});
+      // Right after the opener, and after its earlier popups so they keep their order.
+      const isDescendant = (other: Tab) => {
+        for (let ancestor = other.opener; ancestor; ancestor = ancestor.opener) {
+          if (ancestor === tab) return true;
+        }
+        return false;
+      };
+      let index = tabs.indexOf(tab) + 1;
+      while (tabs[index] && isDescendant(tabs[index] as Tab)) index++;
+      const popup = addTab(index);
+      popup.opener = tab;
+      attachPage(popup, view);
+      if (disposition !== 'background-tab') activateTab(popup);
+      return view.webContents;
+    },
+  };
 }
 
 function readInfo(tab: Tab): TabInfo {
@@ -90,6 +195,8 @@ function readInfo(tab: Tab): TabInfo {
       canGoBack: false,
       canGoForward: false,
       favicon: null,
+      blockedPopups: 0,
+      zoom: 1,
     };
   }
   const contents = tab.view.webContents;
@@ -101,6 +208,8 @@ function readInfo(tab: Tab): TabInfo {
     canGoBack: contents.navigationHistory.canGoBack(),
     canGoForward: contents.navigationHistory.canGoForward(),
     favicon: tab.favicon,
+    blockedPopups: tab.blockedPopups,
+    zoom: Math.round(contents.getZoomFactor() * 100) / 100,
   };
 }
 
@@ -208,6 +317,8 @@ function watchPageEvents(tab: Tab, contents: WebContents): void {
   contents.on('did-stop-loading', onChange);
   contents.on('did-navigate', () => {
     resetFavicon(tab);
+    tab.blockedPopups = 0;
+    if (tab.id === activeId) closeFind();
     onChange();
   });
   contents.on('did-navigate-in-page', onChange);
@@ -221,17 +332,25 @@ function watchPageEvents(tab: Tab, contents: WebContents): void {
   contents.on('page-favicon-updated', (_event, favicons) => {
     loadFavicon(tab, webFaviconUrls(favicons));
   });
-  // A page can close its own webContents (window.close()); the tab goes back to blank.
+  contents.on('found-in-page', (_event, result) => {
+    if (!result.finalUpdate || tab.id !== activeId || ui.isDestroyed()) return;
+    const found: FindResult = {
+      tabId: tab.id,
+      activeMatchOrdinal: result.activeMatchOrdinal,
+      matches: result.matches,
+    };
+    ui.send('find:result', found);
+  });
+  // Ctrl+scroll asks for a zoom step.
+  contents.on('zoom-changed', (_event, direction) => stepZoom(contents, direction));
+  // A page can close its own webContents (window.close()); the tab closes like in other browsers.
   contents.once('destroyed', () => {
-    if (attachedView === tab.view) {
-      if (!window.isDestroyed() && tab.view) window.contentView.removeChildView(tab.view);
-      attachedView = null;
-    }
+    // closeTab or a closing window got here first.
+    if (window.isDestroyed() || !tabs.includes(tab)) return;
+    // The view's webContents is gone, so closeTab must not touch it.
+    if (attachedView === tab.view) detachView();
     tab.view = null;
-    resetFavicon(tab);
-    lastSent.delete(tab.id);
-    queueUpdate(tab.id);
-    if (tab.id === activeId && !ui.isDestroyed()) ui.focus();
+    closeTab(tab);
   });
 }
 
@@ -267,12 +386,9 @@ function navigate(tab: Tab, input: string): boolean {
     if (target !== '' && !app.isPackaged) console.warn(`Refused to navigate to ${target}`);
     return false;
   }
-  if (!tab.view) {
-    tab.view = createView();
-    watchPageEvents(tab, tab.view.webContents);
-  }
+  if (!tab.view) attachPage(tab, createView());
   // Failures are reported through did-fail-load (error pages come in a later step).
-  tab.view.webContents.loadURL(new URL(target).href).catch(() => {});
+  tab.view?.webContents.loadURL(new URL(target).href).catch(() => {});
   if (tab.id === activeId) focusOnAttach = true;
   layout();
   return true;
@@ -286,6 +402,10 @@ function addTab(index: number): Tab {
     faviconKey: '',
     faviconFetch: null,
     htmlFullscreen: false,
+    opener: null,
+    recentPopups: [],
+    blockedPopups: 0,
+    lastInputAt: 0,
   };
   tabs.splice(index, 0, tab);
   queueUpdate(tab.id); // sends the new tab's full info
@@ -295,6 +415,7 @@ function addTab(index: number): Tab {
 
 // A tab with a page gets focus once its view is attached; a blank tab hands focus to the address field.
 function activateTab(tab: Tab): void {
+  if (tab.id !== activeId) closeFind();
   activeId = tab.id;
   queueStructureUpdate();
   if (tab.view) focusOnAttach = true;
@@ -327,7 +448,12 @@ function closeTab(tab: Tab): void {
     tab.view = null;
   }
   if (tab.id !== activeId) return;
-  const neighbour = tabs[index] ?? tabs[index - 1];
+  for (const other of tabs) {
+    if (other.opener === tab) other.opener = null;
+  }
+  // Closing a popup goes back to the tab that opened it, like other browsers.
+  const opener = tab.opener && tabs.includes(tab.opener) ? tab.opener : null;
+  const neighbour = opener ?? tabs[index] ?? tabs[index - 1];
   if (neighbour) activateTab(neighbour);
   else createTab(); // closing the last tab leaves a blank one
 }
@@ -361,6 +487,33 @@ function go(tab: Tab, action: TabAction): void {
 function toggleDevTools(contents: WebContents): void {
   if (contents.isDevToolsOpened()) contents.closeDevTools();
   else contents.openDevTools({ mode: 'detach' }); // a WebContentsView has no window to dock into
+}
+
+// Hides the find strip and clears the highlighted matches of the active tab.
+function closeFind(): void {
+  if (!findOpen) return;
+  findOpen = false;
+  findText = '';
+  findTab(activeId)?.view?.webContents.stopFindInPage('clearSelection');
+  if (!ui.isDestroyed()) ui.send('ui:close-find');
+}
+
+// Zoom is per origin in Chromium, so a change can show up in every tab on that site.
+function queueZoomUpdates(): void {
+  for (const tab of tabs) {
+    if (tab.view) queueUpdate(tab.id);
+  }
+}
+
+function stepZoom(contents: WebContents, direction: 'in' | 'out'): void {
+  const current = contents.getZoomFactor();
+  const next =
+    direction === 'in'
+      ? ZOOM_STEPS.find((step) => step > current + ZOOM_EPSILON)
+      : ZOOM_STEPS.findLast((step) => step < current - ZOOM_EPSILON);
+  if (next === undefined) return;
+  contents.setZoomFactor(next);
+  queueZoomUpdates();
 }
 
 function switchTab(offset: number): void {
@@ -413,6 +566,31 @@ function runShortcut(action: ShortcutAction): void {
     case 'toggle-ui-devtools':
       toggleDevTools(ui);
       break;
+    case 'find':
+      if (!active?.view) break;
+      findOpen = true;
+      ui.focus();
+      ui.send('ui:open-find');
+      break;
+    case 'find-next':
+    case 'find-previous':
+      if (findText !== '') {
+        active?.view?.webContents.findInPage(findText, {
+          forward: action === 'find-next',
+          findNext: true,
+        });
+      }
+      break;
+    case 'zoom-in':
+      if (active?.view) stepZoom(active.view.webContents, 'in');
+      break;
+    case 'zoom-out':
+      if (active?.view) stepZoom(active.view.webContents, 'out');
+      break;
+    case 'zoom-reset':
+      active?.view?.webContents.setZoomFactor(1);
+      queueZoomUpdates();
+      break;
   }
 }
 
@@ -422,6 +600,8 @@ export function handleShortcuts(contents: WebContents): void {
     const action = matchShortcut(input);
     if (!action) return;
     if (action === 'toggle-ui-devtools' && app.isPackaged) return;
+    // F3 and Ctrl+G only mean "next match" while the strip is open; otherwise the page keeps them.
+    if ((action === 'find-next' || action === 'find-previous') && !findOpen) return;
     if (action === 'stop') {
       // The UI uses Esc in the address field, so only a loading page is stopped, and not in HTML fullscreen.
       const active = findTab(activeId);
@@ -461,6 +641,12 @@ function getTab(id: unknown): Tab {
   const tab = findTabArg(id);
   if (!tab) throw new Error('Unknown tab');
   return tab;
+}
+
+function isFindOptions(value: unknown): value is FindOptions {
+  if (typeof value !== 'object' || value === null) return false;
+  const options = value as Record<string, unknown>;
+  return typeof options.forward === 'boolean' && typeof options.findNext === 'boolean';
 }
 
 function isPageArea(value: unknown): value is PageArea {
@@ -508,6 +694,34 @@ export function initTabs(appWindow: BaseWindow, uiContents: WebContents): void {
     if (tab) activateTab(tab);
   });
   handleFromUi('tabs:duplicate', (_event, id) => duplicateTab(getTab(id)).id);
+  handleFromUi('tab:reset-zoom', (_event, id) => {
+    getTab(id).view?.webContents.setZoomFactor(1);
+    queueZoomUpdates();
+  });
+  handleFromUi('find:query', (_event, id, text, options) => {
+    const tab = getTab(id);
+    if (typeof text !== 'string' || text.length > MAX_FIND_LENGTH) throw new Error('Bad text');
+    if (!isFindOptions(options)) throw new Error('Bad options');
+    if (!findOpen || tab.id !== activeId || !tab.view) return;
+    findText = text;
+    if (text === '') tab.view.webContents.stopFindInPage('clearSelection');
+    else {
+      // A new search must omit findNext: passing findNext: false makes Chromium report nothing.
+      tab.view.webContents.findInPage(text, {
+        forward: options.forward,
+        ...(options.findNext && { findNext: true }),
+      });
+    }
+  });
+  handleFromUi('find:stop', (_event, id, focusPage) => {
+    const tab = getTab(id);
+    if (typeof focusPage !== 'boolean') throw new Error('Bad argument');
+    if (tab.id !== activeId) return;
+    findOpen = false;
+    findText = '';
+    tab.view?.webContents.stopFindInPage('clearSelection');
+    if (focusPage) tab.view?.webContents.focus(); // the strip is closed, so the page gets the keyboard back
+  });
   handleFromUi('page:set-area', (_event, area) => {
     if (!isPageArea(area)) throw new Error('Bad page area');
     setPageArea(area);

@@ -31,7 +31,6 @@ describe('matchShortcut', () => {
     expect(matchShortcut(press('1', { control: true, code: 'Digit1' }))).toEqual({ selectTab: 1 });
     expect(matchShortcut(press('8', { control: true, code: 'Digit8' }))).toEqual({ selectTab: 8 });
     expect(matchShortcut(press('9', { control: true, code: 'Digit9' }))).toBe('last-tab');
-    expect(matchShortcut(press('0', { control: true, code: 'Digit0' }))).toBeNull();
   });
 
   it('falls back to key for digits when code is empty', () => {
@@ -85,6 +84,44 @@ describe('matchShortcut', () => {
     expect(matchShortcut(press('T', { control: true, shift: true }))).toBeNull();
     expect(matchShortcut(press('t', { control: true, alt: true }))).toBeNull();
     expect(matchShortcut(press('t'))).toBeNull();
+  });
+
+  it('finds in the page', () => {
+    expect(matchShortcut(press('f', { control: true }))).toBe('find');
+    expect(matchShortcut(press('g', { control: true }))).toBe('find-next');
+    expect(matchShortcut(press('G', { control: true, shift: true }))).toBe('find-previous');
+    expect(matchShortcut(press('F3'))).toBe('find-next');
+    expect(matchShortcut(press('F3', { shift: true }))).toBe('find-previous');
+    expect(matchShortcut(press('f'))).toBeNull();
+  });
+
+  it('zooms with Ctrl and the physical key', () => {
+    expect(matchShortcut(press('=', { control: true, code: 'Equal' }))).toBe('zoom-in');
+    expect(matchShortcut(press('+', { control: true, shift: true, code: 'Equal' }))).toBe(
+      'zoom-in',
+    );
+    expect(matchShortcut(press('+', { control: true, code: 'NumpadAdd' }))).toBe('zoom-in');
+    expect(matchShortcut(press('-', { control: true, code: 'Minus' }))).toBe('zoom-out');
+    expect(matchShortcut(press('-', { control: true, code: 'NumpadSubtract' }))).toBe('zoom-out');
+    expect(matchShortcut(press('0', { control: true, code: 'Digit0' }))).toBe('zoom-reset');
+    expect(matchShortcut(press('0', { control: true, code: 'Numpad0' }))).toBe('zoom-reset');
+  });
+
+  it('matches the zoom characters by key whatever the code', () => {
+    expect(matchShortcut(press('-', { control: true, code: 'Slash' }))).toBe('zoom-out');
+    expect(matchShortcut(press('=', { control: true, code: 'Slash' }))).toBe('zoom-in');
+  });
+
+  it('falls back to key for zoom when code is empty', () => {
+    expect(matchShortcut(press('=', { control: true }))).toBe('zoom-in');
+    expect(matchShortcut(press('+', { control: true }))).toBe('zoom-in');
+    expect(matchShortcut(press('-', { control: true }))).toBe('zoom-out');
+    expect(matchShortcut(press('0', { control: true }))).toBe('zoom-reset');
+  });
+
+  it('does not zoom without Ctrl or with Alt', () => {
+    expect(matchShortcut(press('-', { code: 'Minus' }))).toBeNull();
+    expect(matchShortcut(press('-', { control: true, alt: true, code: 'Minus' }))).toBeNull();
   });
 
   it('ignores key releases and the Meta key', () => {

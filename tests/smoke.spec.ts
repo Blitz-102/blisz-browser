@@ -1,5 +1,8 @@
+import { mkdtempSync, rmSync } from 'node:fs';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   type ElectronApplication,
   _electron as electron,
@@ -9,13 +12,17 @@ import {
 } from '@playwright/test';
 import type { TabsState } from '../src/shared/tabs';
 
-function launch(): Promise<ElectronApplication> {
-  return electron.launch({
+// Each launch gets a throwaway profile, so tests never touch (or depend on) the real one.
+async function launch(): Promise<ElectronApplication> {
+  const userData = mkdtempSync(join(tmpdir(), 'blisz-test-'));
+  const app = await electron.launch({
     // Scale factor 1 so 1280x800 is exact; at 125% display scaling Windows rounds the height to 801.
     args: ['.', '--force-device-scale-factor=1'],
     // Blank forces the built blisz:// UI instead of a dev server URL from the environment.
-    env: { ...process.env, ELECTRON_RENDERER_URL: '' },
+    env: { ...process.env, ELECTRON_RENDERER_URL: '', BLISZ_USER_DATA: userData },
   });
+  app.on('close', () => rmSync(userData, { recursive: true, force: true, maxRetries: 5 }));
+  return app;
 }
 
 // app.windows() also lists page views, so find the UI by its URL.
@@ -418,5 +425,340 @@ test('keyboard shortcuts work from the UI and from a page', async () => {
   } finally {
     server.closeAllConnections();
     server.close();
+  }
+});
+
+// One fixture site for the popup, find and zoom tests.
+const FIXTURE_PAGES: Record<string, string> = {
+  '/': `<title>Fixture home</title>
+    <a href="/popup" target="_blank">Open popup</a>
+    <a href="/closer" target="_blank">Open closer</a>
+    <button onclick="window.open('/popup'); window.open('/popup')">Open two</button>`,
+  '/popup': `<title>Fixture popup</title><script>document.title = window.opener !== null ? 'opener:yes' : 'opener:no'</script>`,
+  '/closer': '<title>Fixture closer</title><script>setTimeout(() => window.close(), 1000)</script>',
+  '/spam': `<title>Fixture spam</title>
+    <script>setTimeout(() => { for (let i = 0; i < 5; i++) window.open('/popup') }, 100)</script>`,
+  '/links':
+    '<title>Fixture links</title><a href="/popup">One</a> <a href="/popup">Two</a> <a href="/popup">Three</a>',
+  '/text': '<title>Fixture text</title><p>needle one, needle two, needle three</p>',
+};
+
+async function startFixture(): Promise<{ home: string; stop: () => void }> {
+  const server = createServer((request, response) => {
+    response.setHeader('Content-Type', 'text/html');
+    response.end(FIXTURE_PAGES[request.url ?? '/'] ?? FIXTURE_PAGES['/']);
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const home = `http://127.0.0.1:${(server.address() as AddressInfo).port}/`;
+  return {
+    home,
+    stop: () => {
+      server.closeAllConnections();
+      server.close();
+    },
+  };
+}
+
+// Starts the app on the fixture site with the home page open in the first tab. Popup tests each
+// get their own app because the rate limit remembers popups for 5 s.
+async function openFixtureSession() {
+  const fixture = await startFixture();
+  const { home } = fixture;
+  const app = await launch().catch((error) => {
+    fixture.stop();
+    throw error;
+  });
+  const close = async () => {
+    await app.close();
+    fixture.stop();
+  };
+  try {
+    const ui = await findUi(app);
+    const address = ui.getByRole('textbox', { name: 'Address' });
+    const getState = () => ui.evaluate<TabsState>('window.bliss.getTabsState()');
+    const pageAt = (url: string) => {
+      const view = app.windows().find((window) => window.url() === url);
+      if (!view) throw new Error(`Page view not found at ${url}`);
+      return view;
+    };
+    await address.fill(home);
+    await address.press('Enter');
+    await expect.poll(async () => (await getState()).tabs[0]?.title).toBe('Fixture home');
+    const [openerId] = (await getState()).order;
+    return { app, ui, address, home, openerId, getState, pageAt, close };
+  } catch (error) {
+    await close();
+    throw error;
+  }
+}
+
+const SECURE_SETUP = {
+  samePartition: true,
+  sandbox: true,
+  contextIsolation: true,
+  nodeIntegration: false,
+  webSecurity: true,
+  safeDialogs: true, // pages get the "prevent more dialogs" checkbox
+  preload: null,
+};
+
+// What a page view at `url` runs with: its session and the web preferences it was created with.
+function secureSetup(app: ElectronApplication, url: string) {
+  return app.evaluate(({ webContents, session }, url) => {
+    const contents = webContents.getAllWebContents().find((c) => c.getURL() === url);
+    const preferences = (
+      contents as unknown as { getLastWebPreferences(): Electron.WebPreferences }
+    ).getLastWebPreferences();
+    return {
+      samePartition: contents?.session === session.fromPartition('persist:main'),
+      sandbox: preferences.sandbox,
+      contextIsolation: preferences.contextIsolation,
+      nodeIntegration: preferences.nodeIntegration,
+      webSecurity: preferences.webSecurity,
+      safeDialogs: preferences.safeDialogs,
+      preload: preferences.preload ?? null,
+    };
+  }, url);
+}
+
+test('a target=_blank link opens an active tab with the same secure setup', async () => {
+  const { app, ui, home, openerId, getState, pageAt, close } = await openFixtureSession();
+  try {
+    await pageAt(home).getByRole('link', { name: 'Open popup' }).click();
+    await expect.poll(async () => (await getState()).order.length).toBe(2);
+    expect((await getState()).activeId).not.toBe(openerId);
+    await expect.poll(async () => (await getState()).tabs[1]?.url).toBe(`${home}popup`);
+    // Links with target=_blank are noopener by default in Chromium.
+    await expect.poll(async () => (await getState()).tabs[1]?.title).toBe('opener:no');
+
+    // Known gap: Electron does not apply safeDialogs to the webContents it creates for
+    // window.opener, whatever overrideBrowserWindowOptions says. Revisit when this fails.
+    expect(await secureSetup(app, `${home}popup`)).toEqual({ ...SECURE_SETUP, safeDialogs: false });
+
+    // Closing the popup tab goes back to its opener.
+    await ui.evaluate(`window.bliss.closeTab(${(await getState()).activeId})`);
+    await expect.poll(async () => (await getState()).activeId).toBe(openerId);
+  } finally {
+    await close();
+  }
+});
+
+test('window.open keeps window.opener, and a second popup from the same click is blocked', async () => {
+  const { ui, address, home, openerId, getState, pageAt, close } = await openFixtureSession();
+  try {
+    // The first popup becomes the active tab, so the second comes from an inactive opener.
+    await pageAt(home).getByRole('button', { name: 'Open two' }).click();
+    await expect.poll(async () => (await getState()).order.length).toBe(2);
+    await expect.poll(async () => (await getState()).tabs[1]?.title).toBe('opener:yes');
+    await expect.poll(async () => (await getState()).tabs[0]?.blockedPopups).toBe(1);
+
+    // Back on the opener the note shows, and a navigation clears it.
+    await ui.getByRole('button', { name: 'Fixture home', exact: true }).click();
+    await expect(ui.getByText('Popup blocked')).toBeVisible();
+    await address.fill(`${home}text`);
+    await address.press('Enter');
+    await expect.poll(async () => (await getState()).tabs[0]?.blockedPopups).toBe(0);
+    await expect(ui.getByText('Popup blocked')).toHaveCount(0);
+    expect((await getState()).activeId).toBe(openerId);
+  } finally {
+    await close();
+  }
+});
+
+test('no-gesture popup spam is blocked and noted', async () => {
+  const { ui, address, home, getState, close } = await openFixtureSession();
+  try {
+    await address.fill(`${home}spam`);
+    await address.press('Enter');
+    // Without a real click or key none of the five opens, and the opener stays active.
+    await expect.poll(async () => (await getState()).tabs[0]?.blockedPopups).toBe(5);
+    expect((await getState()).order).toHaveLength(1);
+    await expect(ui.getByText('Popup blocked')).toBeVisible();
+  } finally {
+    await close();
+  }
+});
+
+test('background popups are limited to two in five seconds', async () => {
+  const { app, ui, address, home, openerId, getState, pageAt, close } = await openFixtureSession();
+  try {
+    await address.fill(`${home}links`);
+    await address.press('Enter');
+    await expect.poll(async () => (await getState()).tabs[0]?.title).toBe('Fixture links');
+    // A middle click opens a background tab, so the opener stays active. It is sent with
+    // sendInputEvent because Playwright's own middle click waits for the new page and hangs.
+    for (const index of [0, 1, 2]) {
+      const [x = 0, y = 0] = await pageAt(`${home}links`).evaluate<number[]>(
+        `(() => { const r = document.querySelectorAll('a')[${index}].getBoundingClientRect(); return [Math.round(r.x + 2), Math.round(r.y + 2)]; })()`,
+      );
+      await app.evaluate(
+        ({ webContents }, { url, x, y }) => {
+          const contents = webContents.getAllWebContents().find((c) => c.getURL() === url);
+          const click = { x, y, button: 'middle', clickCount: 1 } as const;
+          contents?.sendInputEvent({ type: 'mouseMove', x, y });
+          contents?.sendInputEvent({ type: 'mouseDown', ...click });
+          contents?.sendInputEvent({ type: 'mouseUp', ...click });
+        },
+        { url: `${home}links`, x, y },
+      );
+    }
+    await expect.poll(async () => (await getState()).order.length).toBe(3);
+    await expect.poll(async () => (await getState()).tabs[0]?.blockedPopups).toBe(1);
+    expect((await getState()).activeId).toBe(openerId);
+    await expect(ui.getByText('Popup blocked')).toBeVisible();
+    // A background popup is a view we created, with the same secure setup.
+    await expect.poll(async () => (await getState()).tabs[1]?.url).toBe(`${home}popup`);
+    expect(await secureSetup(app, `${home}popup`)).toEqual(SECURE_SETUP);
+  } finally {
+    await close();
+  }
+});
+
+test('a popup that closes itself closes its tab and re-activates the opener', async () => {
+  const { app, home, openerId, getState, pageAt, close } = await openFixtureSession();
+  try {
+    await pageAt(home).getByRole('link', { name: 'Open closer' }).click();
+    await expect.poll(async () => (await getState()).order.length).toBe(2);
+    await expect.poll(async () => (await getState()).order).toEqual([openerId]);
+    expect((await getState()).activeId).toBe(openerId);
+    // The opener still works afterwards.
+    await expect(pageAt(home).getByRole('link', { name: 'Open popup' })).toBeVisible();
+    expect(await app.evaluate(({ webContents }) => webContents.getAllWebContents().length)).toBe(2);
+  } finally {
+    await close();
+  }
+});
+
+test('find strip: Ctrl+F, counts, next and previous, shrinking the page, closing', async () => {
+  const fixture = await startFixture();
+  const { home } = fixture;
+  const app = await launch();
+  try {
+    const ui = await findUi(app);
+    const address = ui.getByRole('textbox', { name: 'Address' });
+    const find = ui.getByRole('textbox', { name: 'Find in page' });
+    const count = ui.getByText(/^\d+ of \d+$/);
+    const pageArea = ui.getByRole('main');
+    const areaHeight = async () => (await pageArea.boundingBox())?.height ?? 0;
+    const attachedHeight = () =>
+      app.evaluate(({ BaseWindow }) => {
+        const view = BaseWindow.getAllWindows()[0]?.contentView.children.find((child) =>
+          (child as Electron.WebContentsView).webContents.getURL().startsWith('http'),
+        );
+        return (view as Electron.WebContentsView).getBounds().height;
+      });
+
+    await address.fill(`${home}text`);
+    await address.press('Enter');
+    await expect(ui.locator('[aria-current="page"]')).toContainText('Fixture text');
+    const fullHeight = await areaHeight();
+
+    await pressKey(app, home, 'F', ['control']);
+    await expect(find).toBeFocused();
+    // The page area, and with it the page view, shrinks while the strip is open.
+    await expect.poll(areaHeight).toBeLessThan(fullHeight);
+    await expect
+      .poll(async () => Math.abs((await attachedHeight()) - (await areaHeight())))
+      .toBeLessThanOrEqual(1);
+
+    await find.fill('needle');
+    await expect(count).toHaveText('1 of 3');
+    await find.press('Enter');
+    await expect(count).toHaveText('2 of 3');
+    await find.press('Shift+Enter');
+    await expect(count).toHaveText('1 of 3');
+    await ui.getByRole('button', { name: 'Next match' }).click();
+    await expect(count).toHaveText('2 of 3');
+    await ui.getByRole('button', { name: 'Previous match' }).click();
+    await expect(count).toHaveText('1 of 3');
+    await pressKey(app, 'blisz://', 'F3');
+    await expect(count).toHaveText('2 of 3');
+    await pressKey(app, 'blisz://', 'F3', ['shift']);
+    await expect(count).toHaveText('1 of 3');
+    await find.fill('nothing like this');
+    await expect(count).toHaveText('0 of 0');
+
+    // Ctrl+F again focuses the existing input.
+    await ui.getByRole('button', { name: 'Next match' }).focus();
+    await pressKey(app, 'blisz://', 'F', ['control']);
+    await expect(find).toBeFocused();
+
+    // Esc closes the strip and the page area grows back.
+    await find.press('Escape');
+    await expect(find).toHaveCount(0);
+    await expect.poll(areaHeight).toBe(fullHeight);
+
+    // F3 does nothing while the strip is closed; switching tabs closes an open strip.
+    await pressKey(app, 'blisz://', 'F3');
+    await expect(find).toHaveCount(0);
+    await pressKey(app, home, 'F', ['control']);
+    await expect(find).toBeFocused();
+    await pressKey(app, 'blisz://', 'T', ['control']);
+    await expect(find).toHaveCount(0);
+  } finally {
+    await app.close();
+    fixture.stop();
+  }
+});
+
+test('zoom: shortcuts, steps, shared by origin, reset button and Ctrl+scroll', async () => {
+  const fixture = await startFixture();
+  const { home } = fixture;
+  const app = await launch();
+  try {
+    const ui = await findUi(app);
+    const address = ui.getByRole('textbox', { name: 'Address' });
+    const resetZoom = ui.getByRole('button', { name: 'Reset zoom' });
+    const getState = () => ui.evaluate<TabsState>('window.bliss.getTabsState()');
+    const zooms = async () => (await getState()).tabs.map((tab) => tab.zoom);
+
+    await address.fill(home);
+    await address.press('Enter');
+    await expect.poll(async () => (await getState()).tabs[0]?.title).toBe('Fixture home');
+    await expect(resetZoom).toHaveCount(0);
+
+    await ui.evaluate('window.bliss.createTab()');
+    await expect(address).toHaveValue(''); // the UI has switched to the new tab
+    await address.fill(`${home}text`);
+    await address.press('Enter');
+    await expect.poll(async () => (await getState()).tabs[1]?.title).toBe('Fixture text');
+
+    // Ctrl+= steps 100 -> 110 -> 125, Ctrl+- goes back; both tabs share the origin's zoom.
+    await pressKey(app, home, '=', ['control']);
+    await expect.poll(zooms).toEqual([1.1, 1.1]);
+    await expect(resetZoom).toHaveText('110%');
+    await pressKey(app, home, '=', ['control']);
+    await expect.poll(zooms).toEqual([1.25, 1.25]);
+    await pressKey(app, home, '-', ['control']);
+    await pressKey(app, home, '-', ['control']);
+    await pressKey(app, home, '-', ['control']);
+    await expect.poll(zooms).toEqual([0.9, 0.9]);
+
+    await resetZoom.click();
+    await expect.poll(zooms).toEqual([1, 1]);
+    await expect(resetZoom).toHaveCount(0);
+
+    await pressKey(app, home, '=', ['control']);
+    await expect.poll(zooms).toEqual([1.1, 1.1]);
+    await pressKey(app, home, '0', ['control']);
+    await expect.poll(zooms).toEqual([1, 1]);
+
+    // Ctrl+scroll up zooms in (a synthetic wheel event can count as more than one notch).
+    await app.evaluate(({ webContents }, target) => {
+      const contents = webContents.getAllWebContents().find((c) => c.getURL().startsWith(target));
+      contents?.sendInputEvent({
+        type: 'mouseWheel',
+        x: 100,
+        y: 100,
+        deltaX: 0,
+        deltaY: 120,
+        wheelTicksY: 1,
+        modifiers: ['control'],
+      });
+    }, home);
+    await expect.poll(async () => (await zooms())[0]).toBeGreaterThan(1);
+  } finally {
+    await app.close();
+    fixture.stop();
   }
 });

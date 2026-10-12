@@ -10,6 +10,8 @@ const tab: TabInfo = {
   canGoBack: false,
   canGoForward: false,
   favicon: null,
+  blockedPopups: 0,
+  zoom: 1,
 };
 
 const state: TabsState = { activeId: 1, order: [1, 2], tabs: [tab, { ...tab, id: 2 }] };
@@ -33,6 +35,13 @@ describe('diffTabInfo', () => {
   it('reports a favicon change', () => {
     const favicon = 'data:image/png;base64,AAAA';
     expect(diffTabInfo(tab, { ...tab, favicon })).toEqual({ favicon });
+  });
+
+  it('reports a changed blocked popup count and zoom', () => {
+    expect(diffTabInfo(tab, { ...tab, blockedPopups: 2, zoom: 1.1 })).toEqual({
+      blockedPopups: 2,
+      zoom: 1.1,
+    });
   });
 });
 
@@ -63,6 +72,15 @@ describe('applyTabsUpdate', () => {
     const next = applyTabsUpdate(state, { activeId: 2, order: [2], tabs: {} });
     expect(next.order).toEqual([2]);
     expect(next.tabs).toEqual([state.tabs[1]]);
+  });
+
+  it('applies blocked popup and zoom changes', () => {
+    const next = applyTabsUpdate(state, {
+      activeId: 1,
+      order: [1, 2],
+      tabs: { 2: { blockedPopups: 1, zoom: 1.25 } },
+    });
+    expect(next.tabs[1]).toMatchObject({ blockedPopups: 1, zoom: 1.25 });
   });
 
   it('gives the same result when applied twice', () => {

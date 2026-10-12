@@ -13,6 +13,12 @@ export type ShortcutAction =
   | 'forward'
   | 'toggle-devtools'
   | 'toggle-ui-devtools'
+  | 'find'
+  | 'find-next'
+  | 'find-previous'
+  | 'zoom-in'
+  | 'zoom-out'
+  | 'zoom-reset'
   | { selectTab: number }; // 1-based position in sidebar order
 
 // The part of Electron's Input that matching needs.
@@ -20,6 +26,15 @@ export type ShortcutInput = Pick<
   Electron.Input,
   'type' | 'key' | 'code' | 'control' | 'shift' | 'alt' | 'meta'
 >;
+
+// The characters match on key, so layouts that put them elsewhere work. Digit 0 matches the
+// physical key (sendInputEvent leaves code empty, so key is the fallback).
+function matchZoom({ key, code }: ShortcutInput): ShortcutAction | null {
+  if (key === '=' || key === '+' || code === 'NumpadAdd') return 'zoom-in';
+  if (key === '-' || key === '_' || code === 'NumpadSubtract') return 'zoom-out';
+  if (code === 'Digit0' || code === 'Numpad0' || (code === '' && key === '0')) return 'zoom-reset';
+  return null;
+}
 
 export function matchShortcut(input: ShortcutInput): ShortcutAction | null {
   if (input.type !== 'keyDown' || input.meta) return null;
@@ -37,9 +52,13 @@ export function matchShortcut(input: ShortcutInput): ShortcutAction | null {
   if (ctrl && !alt) {
     if (key === 'Tab') return shift ? 'previous-tab' : 'next-tab';
     if (key === 'F5') return 'reload-ignoring-cache';
+    // Ctrl+Plus is Ctrl+Shift+= on most layouts, so zoom is matched before the Shift check.
+    const zoom = matchZoom(input);
+    if (zoom) return zoom;
     if (shift) {
       if (letter === 'r') return 'reload-ignoring-cache';
       if (letter === 'i') return 'toggle-devtools';
+      if (letter === 'g') return 'find-previous';
       return null;
     }
     // Digits match the physical key so they also work on layouts where the digit row needs Shift.
@@ -53,6 +72,10 @@ export function matchShortcut(input: ShortcutInput): ShortcutAction | null {
         return 'close-tab';
       case 'l':
         return 'focus-address';
+      case 'f':
+        return 'find';
+      case 'g':
+        return 'find-next';
       case 'r':
         return 'reload';
     }
@@ -68,6 +91,7 @@ export function matchShortcut(input: ShortcutInput): ShortcutAction | null {
 
   if (ctrl || alt) return null;
   if (key === 'F5') return shift ? 'reload-ignoring-cache' : 'reload';
+  if (key === 'F3') return shift ? 'find-previous' : 'find-next';
   if (shift) return null;
   if (key === 'F6') return 'focus-address';
   if (key === 'F12') return 'toggle-devtools';

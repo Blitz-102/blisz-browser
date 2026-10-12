@@ -2,6 +2,38 @@
 
 Newest at the top. Each entry: what was chosen, what else was considered, why, and when to revisit.
 
+## 2026-10-12: Smoke tests use a temporary profile
+- Chosen: when unpackaged, `BLISZ_USER_DATA` sets `userData`. Every smoke launch gets a fresh temp folder, which is deleted afterwards.
+- Alternatives considered: running against the real profile (what happened until step 2d).
+- Why: the real profile now holds Google cookies, and Playwright opens debugging ports while tests run. This settles the 2026-10-11 constraint early. A run was confirmed to leave `%APPDATA%\bliss-browser` untouched.
+- Revisit if: `bench:memory` starts opening real sites (2g). Give it a temp profile too, for consistent numbers.
+- Status: settled
+
+## 2026-10-12: Find strip and zoom
+- Chosen:
+  - **Find:** Ctrl+F opens a strip above the page (user decision), using `findInPage`. It shows "n of m"; F3 and Ctrl+G go to the next match. It closes on tab switch, on navigation, and when the memory panel opens.
+  - **Zoom:**
+    - Chrome's steps, with Ctrl+Plus/Minus/0 and Ctrl+scroll.
+    - Same-origin by default (Chromium), so one site's zoom applies to all its tabs.
+    - Chromium also saves it per host in the profile, so it survives restarts.
+    - A reset button in the address field appears when zoom isn't 100%.
+- Alternatives considered: the find bar in the sidebar; our own zoom map.
+- Why: the user's choice for find. For zoom, Chromium's built-in behaviour means no code of our own.
+- Revisit if: Phase 3 wants zoom stored with other site settings.
+- Status: settled
+
+## 2026-10-12: Popups adopted as tabs, gated by real user input
+- Chosen:
+  - **Allowed:** an `http(s)` or exactly `about:blank` URL; a foreground-tab, background-tab or new-window disposition.
+  - **Gates:** the opener must be the active tab and must have had real input (mouse, key or touch, through `input-event`) in the last 5 s. One gesture opens one popup, with a cap of 2 per 5 s. Blocked popups show a "Popup blocked" note.
+  - **Adopting:** `window.open` popups are adopted with `createWindow(options.webContents)`, which keeps `window.opener` for sign-in flows, with `outlivesOpener: true`.
+  - **Closing:** closing an active popup returns to its opener. A page closing itself closes its tab.
+- Alternatives considered: deny and open the URL in a new tab (breaks OAuth); a rate limit only (popups can chain past it).
+- Why: Electron has no popup blocker. Requiring a gesture is what Chromium's blocker does, and it ends popup chains.
+- Known gap: popups Chromium creates for `window.opener` don't get `safeDialogs`. Electron doesn't apply `overrideBrowserWindowOptions` to them. A popup could loop `alert()` with no "prevent more dialogs" checkbox.
+- Revisit if: step 2f handles dialogs (close the gap there if Electron allows it), or Electron fixes the override for adopted guests.
+- Status: provisional
+
 ## 2026-10-12: Packaged builds refuse remote debugging switches
 - Chosen: when packaged, `app.exit(1)` at startup if `--remote-debugging-port` or `--remote-debugging-pipe` is present.
 - Alternatives considered: relying on fuses (none covers this switch); `devTools: false` (doesn't stop CDP).
