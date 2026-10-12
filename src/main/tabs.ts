@@ -5,6 +5,7 @@ import { diffTabInfo } from '../shared/tabsUpdate';
 import { isWebUrl } from '../shared/url';
 import { fetchFavicon, webFaviconUrls } from './favicon';
 import { handleFromUi } from './ipc';
+import { matchShortcut, type ShortcutAction } from './shortcuts';
 
 // The one place the page session is named. The UI view uses the default session, which is the
 // only one that serves blisz://, so web pages can't reach app files.
@@ -17,12 +18,15 @@ const MAX_LABEL_LENGTH = 40;
 const BIDI_CONTROLS = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
 const ACTIONS: readonly string[] = ['back', 'forward', 'reload', 'stop'] satisfies TabAction[];
 
+const REPEATABLE_ACTIONS = new Set<ShortcutAction>(['next-tab', 'previous-tab', 'back', 'forward']);
+
 interface Tab {
   id: number;
   view: WebContentsView | null; // created on the first navigation, so a blank tab costs no renderer
   favicon: string | null;
   faviconKey: string; // the candidates being fetched or already shown, to skip repeated events
   faviconFetch: AbortController | null;
+  htmlFullscreen: boolean; // Esc leaves HTML fullscreen, so it must reach the page
 }
 
 // The page area as distances from the window edges, so a window resize can be applied at once.
@@ -68,6 +72,11 @@ function createView(): WebContentsView {
     },
   });
   pageContents.add(view.webContents);
+  handleShortcuts(view.webContents);
+  // A link opened from DevTools becomes a tab, web URLs only (never shell.openExternal).
+  view.webContents.on('devtools-open-url', (_event, url) => {
+    if (isWebUrl(url)) navigate(createTab(), url);
+  });
   return view;
 }
 
@@ -203,6 +212,12 @@ function watchPageEvents(tab: Tab, contents: WebContents): void {
   });
   contents.on('did-navigate-in-page', onChange);
   contents.on('page-title-updated', onChange);
+  contents.on('enter-html-full-screen', () => {
+    tab.htmlFullscreen = true;
+  });
+  contents.on('leave-html-full-screen', () => {
+    tab.htmlFullscreen = false;
+  });
   contents.on('page-favicon-updated', (_event, favicons) => {
     loadFavicon(tab, webFaviconUrls(favicons));
   });
@@ -270,6 +285,7 @@ function addTab(index: number): Tab {
     favicon: null,
     faviconKey: '',
     faviconFetch: null,
+    htmlFullscreen: false,
   };
   tabs.splice(index, 0, tab);
   queueUpdate(tab.id); // sends the new tab's full info
@@ -340,6 +356,88 @@ function go(tab: Tab, action: TabAction): void {
   else if (action === 'forward') contents.navigationHistory.goForward();
   else if (action === 'reload') contents.reload();
   else contents.stop();
+}
+
+function toggleDevTools(contents: WebContents): void {
+  if (contents.isDevToolsOpened()) contents.closeDevTools();
+  else contents.openDevTools({ mode: 'detach' }); // a WebContentsView has no window to dock into
+}
+
+function switchTab(offset: number): void {
+  const index = tabs.findIndex((tab) => tab.id === activeId);
+  const next = tabs[(index + offset + tabs.length) % tabs.length];
+  if (next) activateTab(next);
+}
+
+function runShortcut(action: ShortcutAction): void {
+  if (typeof action === 'object') {
+    const tab = tabs[action.selectTab - 1];
+    if (tab) activateTab(tab);
+    return;
+  }
+  const active = findTab(activeId);
+  switch (action) {
+    case 'new-tab':
+      createTab();
+      break;
+    case 'close-tab':
+      if (active) closeTab(active);
+      break;
+    case 'next-tab':
+      switchTab(1);
+      break;
+    case 'previous-tab':
+      switchTab(-1);
+      break;
+    case 'last-tab': {
+      const last = tabs.at(-1);
+      if (last) activateTab(last);
+      break;
+    }
+    case 'focus-address':
+      ui.focus();
+      ui.send('ui:focus-address');
+      break;
+    case 'reload':
+    case 'back':
+    case 'forward':
+    case 'stop':
+      if (active) go(active, action);
+      break;
+    case 'reload-ignoring-cache':
+      active?.view?.webContents.reloadIgnoringCache();
+      break;
+    case 'toggle-devtools':
+      if (active?.view) toggleDevTools(active.view.webContents);
+      break;
+    case 'toggle-ui-devtools':
+      toggleDevTools(ui);
+      break;
+  }
+}
+
+// Browser shortcuts must work whichever view has focus (PLAN 4.5), so every view but DevTools gets this.
+export function handleShortcuts(contents: WebContents): void {
+  contents.on('before-input-event', (event, input) => {
+    const action = matchShortcut(input);
+    if (!action) return;
+    if (action === 'toggle-ui-devtools' && app.isPackaged) return;
+    if (action === 'stop') {
+      // The UI uses Esc in the address field, so only a loading page is stopped, and not in HTML fullscreen.
+      const active = findTab(activeId);
+      if (
+        contents !== active?.view?.webContents ||
+        active.htmlFullscreen ||
+        !contents.isLoading()
+      ) {
+        return;
+      }
+    }
+    event.preventDefault();
+    // Holding a key must not open or close dozens of tabs; only cycling and history repeat.
+    if (input.isAutoRepeat && !REPEATABLE_ACTIONS.has(action)) return;
+    runShortcut(action);
+  });
 }
 
 // Google sign-in rejects a UA that claims to be plain Chrome when the engine isn't Chrome, so
@@ -415,6 +513,13 @@ export function initTabs(appWindow: BaseWindow, uiContents: WebContents): void {
     setPageArea(area);
   });
 
+  // Mouse side buttons.
+  window.on('app-command', (_event, command) => {
+    const active = findTab(activeId);
+    if (!active) return;
+    if (command === 'browser-backward') go(active, 'back');
+    else if (command === 'browser-forward') go(active, 'forward');
+  });
   // Recompute at once instead of waiting for the UI to report the new size.
   window.on('resize', layout);
   // WebContentsView contents are not destroyed with the window.

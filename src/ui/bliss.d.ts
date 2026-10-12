@@ -13,5 +13,6 @@ interface Window {
     tabGo(id: number, action: import('../shared/tabs').TabAction): Promise<void>;
     setPageArea(area: import('../shared/tabs').PageArea): Promise<void>;
     onTabsUpdate(callback: (update: import('../shared/tabs').TabsUpdate) => void): () => void;
+    onFocusAddress(callback: () => void): () => void;
   };
 }

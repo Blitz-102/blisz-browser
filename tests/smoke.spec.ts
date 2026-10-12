@@ -292,3 +292,131 @@ test('tabs: create, switch, hide, close, favicon and duplicate', async () => {
     server.close();
   }
 });
+
+// Playwright's keyboard goes through CDP, which skips before-input-event, so keys are sent with
+// webContents.sendInputEvent instead. `target` is the start of the URL of the view that gets the key.
+async function pressKey(
+  app: ElectronApplication,
+  target: string,
+  keyCode: string,
+  modifiers: ('control' | 'shift' | 'alt')[] = [],
+) {
+  await app.evaluate(
+    ({ webContents }, { target, keyCode, modifiers }) => {
+      const contents = webContents.getAllWebContents().find((c) => c.getURL().startsWith(target));
+      if (!contents) throw new Error(`No view at ${target}`);
+      contents.sendInputEvent({ type: 'keyDown', keyCode, modifiers });
+      contents.sendInputEvent({ type: 'keyUp', keyCode, modifiers });
+    },
+    { target, keyCode, modifiers },
+  );
+}
+
+test('keyboard shortcuts work from the UI and from a page', async () => {
+  const server = createServer((request, response) => {
+    response.setHeader('Content-Type', 'text/html');
+    if (request.url === '/next') {
+      response.end('<title>Fixture next</title><p>Second page</p>');
+    } else if (request.url === '/slow') {
+      setTimeout(() => response.end('<title>Fixture slow</title>'), 10_000);
+    } else {
+      response.end('<title>Fixture home</title><a href="/next">Next page</a>');
+    }
+  });
+  try {
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const home = `http://127.0.0.1:${(server.address() as AddressInfo).port}/`;
+    const app = await launch();
+    try {
+      const ui = await findUi(app);
+      const address = ui.getByRole('textbox', { name: 'Address' });
+      const focusView = (target: string) =>
+        app.evaluate(({ webContents }, target) => {
+          webContents
+            .getAllWebContents()
+            .find((c) => c.getURL().startsWith(target))
+            ?.focus();
+        }, target);
+      const isUiFocused = () =>
+        app.evaluate(({ webContents }) =>
+          webContents
+            .getAllWebContents()
+            .find((c) => c.getURL().startsWith('blisz://'))
+            ?.isFocused(),
+        );
+      const getState = () => ui.evaluate<TabsState>('window.bliss.getTabsState()');
+
+      await address.fill(home);
+      await address.press('Enter');
+      await expect.poll(async () => (await getState()).tabs[0]?.title).toBe('Fixture home');
+      const [firstId] = (await getState()).order;
+
+      // Ctrl+T from the page: a new blank tab, and the address field gets focus.
+      await focusView(home);
+      await expect.poll(isUiFocused).toBe(false);
+      await pressKey(app, home, 'T', ['control']);
+      await expect.poll(async () => (await getState()).order.length).toBe(2);
+      await expect.poll(isUiFocused).toBe(true);
+      await expect(address).toBeFocused();
+      const secondId = (await getState()).activeId;
+
+      // Ctrl+Tab wraps in sidebar order, Ctrl+Shift+Tab goes the other way, Ctrl+1 picks by position.
+      await pressKey(app, 'blisz://', 'Tab', ['control']);
+      await expect.poll(async () => (await getState()).activeId).toBe(firstId);
+      await pressKey(app, home, 'Tab', ['control', 'shift']);
+      await expect.poll(async () => (await getState()).activeId).toBe(secondId);
+      await pressKey(app, 'blisz://', '1', ['control']);
+      await expect.poll(async () => (await getState()).activeId).toBe(firstId);
+
+      // Ctrl+L while the page has focus moves focus to the address field.
+      await expect(address).toHaveValue(home);
+      await ui.evaluate('document.activeElement.blur()');
+      await focusView(home);
+      await expect.poll(isUiFocused).toBe(false);
+      await pressKey(app, home, 'L', ['control']);
+      await expect.poll(isUiFocused).toBe(true);
+      await expect(address).toBeFocused();
+      expect(
+        await ui.evaluate<number[]>(
+          '(() => { const i = document.activeElement; return [i.selectionStart, i.selectionEnd, i.value.length]; })()',
+        ),
+      ).toEqual([0, home.length, home.length]);
+
+      // Alt+Left goes back after following a link.
+      await app.evaluate(({ webContents }, target) => {
+        webContents
+          .getAllWebContents()
+          .find((c) => c.getURL().startsWith(target))
+          ?.loadURL(`${target}next`);
+      }, home);
+      await expect.poll(async () => (await getState()).tabs[0]?.title).toBe('Fixture next');
+      await pressKey(app, home, 'Left', ['alt']);
+      await expect.poll(async () => (await getState()).tabs[0]?.title).toBe('Fixture home');
+
+      // Esc stops a slow load.
+      await address.fill(`${home}slow`);
+      await address.press('Enter');
+      await expect.poll(async () => (await getState()).tabs[0]?.isLoading).toBe(true);
+      await pressKey(app, home, 'Escape');
+      await expect.poll(async () => (await getState()).tabs[0]?.isLoading).toBe(false);
+
+      // Ctrl+W closes the active tab; the neighbour takes over.
+      await pressKey(app, home, 'W', ['control']);
+      await expect.poll(async () => (await getState()).order).toEqual([secondId]);
+      // Closing the last tab leaves a blank one.
+      await pressKey(app, 'blisz://', 'W', ['control']);
+      await expect.poll(async () => (await getState()).tabs.map((tab) => tab.url)).toEqual(['']);
+      expect((await getState()).order).not.toContain(secondId);
+
+      // F12 on a blank tab does nothing and the app keeps working.
+      await pressKey(app, 'blisz://', 'F12');
+      await ui.waitForTimeout(200);
+      expect((await getState()).tabs).toHaveLength(1);
+    } finally {
+      await app.close();
+    }
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});

@@ -2,6 +2,27 @@
 
 Newest at the top. Each entry: what was chosen, what else was considered, why, and when to revisit.
 
+## 2026-10-12: Packaged builds refuse remote debugging switches
+- Chosen: when packaged, `app.exit(1)` at startup if `--remote-debugging-port` or `--remote-debugging-pipe` is present.
+- Alternatives considered: relying on fuses (none covers this switch); `devTools: false` (doesn't stop CDP).
+- Why: anything that can launch Blisz could otherwise drive the trusted UI and read cookies over CDP, a known infostealer technique. Unpackaged builds keep the switch for Playwright.
+- Revisit if: Phase 5 packaging. Verify that a packaged build launched with `--remote-debugging-port=9222` doesn't answer on `http://127.0.0.1:9222/json`. Add it to the packaging checklist with the fuses.
+- Status: provisional (until verified in Phase 5)
+
+## 2026-10-12: Keyboard shortcuts via before-input-event
+- Chosen: a pure `matchShortcut` (`src/main/shortcuts.ts`), and one `before-input-event` handler on the UI view and every page view (never on DevTools webContents). Actions run in main.
+  - Matching: letters by `key`, falling back to `code` for non-Latin layouts; digits by `code`, falling back to `key`. AltGr (Ctrl+Alt) never matches.
+  - Auto-repeat is ignored except for next/previous tab and back/forward.
+  - Esc stops loading only when the focused active page is loading and not in HTML fullscreen.
+  - F12 and Ctrl+Shift+I open detached DevTools for the page. The UI's DevTools are on Ctrl+Shift+Alt+I and dev-only; when packaged, that chord passes through to the page.
+  - Links opened from page DevTools become tabs only if they pass `isWebUrl`.
+  - The mouse side buttons use BaseWindow `app-command`.
+  - Browser shortcuts always win over the page's own use of the same keys. Ctrl+K is unbound until Phase 7.
+- Alternatives considered: a hidden application menu with accelerators.
+- Why: works whichever view has focus, needs no menu, and the matching is unit-testable. Pages can't fake these events. The user tested it on Windows.
+- Revisit if: a site's own shortcut matters more than the browser's (add a per-site exception), or Phase 7 adds the console.
+- Status: settled
+
 ## 2026-10-12: Constraints from the step 2b security reviews
 - Chosen:
   - Never add `protocol.handle` to `persist:main` without revisiting `src/main/favicon.ts`. `session.fetch` allows any protocol, and only `isWebUrl` stands in the way.

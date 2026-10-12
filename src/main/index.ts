@@ -14,7 +14,7 @@ import { isWebUrl } from '../shared/url';
 import { runBench } from './bench';
 import { addTrustedUi, handleFromUi, UI_URL } from './ipc';
 import { getMetrics } from './metrics';
-import { getTabProcessLabels, initTabs, isPageContents } from './tabs';
+import { getTabProcessLabels, handleShortcuts, initTabs, isPageContents } from './tabs';
 
 // Native caption buttons via titleBarOverlay (PLAN 4.6); colours come from tokens.css.
 // Fallbacks for --color-frame and --color-text, used only if reading them from the UI fails.
@@ -25,6 +25,16 @@ const TITLE_BAR_HEIGHT = 40;
 // Opaque colours only, as Chromium returns them: a translucent body must not make the window transparent.
 const OPAQUE_RGB = /^rgb\(\d{1,3}, \d{1,3}, \d{1,3}\)$/;
 const READ_COLORS_TIMEOUT_MS = 2000;
+
+// A debugging port lets malware (infostealers) read cookies and drive the UI over CDP. Unpackaged
+// builds keep it because Playwright needs it.
+if (
+  app.isPackaged &&
+  (app.commandLine.hasSwitch('remote-debugging-port') ||
+    app.commandLine.hasSwitch('remote-debugging-pipe'))
+) {
+  app.exit(1);
+}
 
 Menu.setApplicationMenu(null);
 
@@ -151,6 +161,7 @@ function createWindow(): WebContents {
   addTrustedUi(uiView.webContents);
   window.contentView.addChildView(uiView);
   initTabs(window, uiView.webContents);
+  handleShortcuts(uiView.webContents);
 
   // getContentBounds() is in screen coordinates; the view needs window-relative ones.
   const fitUiView = () => {
@@ -200,19 +211,6 @@ function createWindow(): WebContents {
 
   // WebContentsView contents are not destroyed with the window.
   window.on('closed', () => uiView.webContents.close());
-
-  // Dev only: the app menu is removed, so provide DevTools shortcuts here.
-  if (!app.isPackaged) {
-    uiView.webContents.on('before-input-event', (event, input) => {
-      const isDevToolsKey =
-        input.type === 'keyDown' &&
-        (input.key === 'F12' || (input.control && input.shift && input.key.toLowerCase() === 'i'));
-      if (isDevToolsKey) {
-        event.preventDefault();
-        uiView.webContents.toggleDevTools();
-      }
-    });
-  }
 
   uiView.webContents.loadURL(UI_URL);
   return uiView.webContents;

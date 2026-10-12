@@ -22,4 +22,10 @@ contextBridge.exposeInMainWorld('bliss', {
     ipcRenderer.on('tabs:update', listener);
     return () => ipcRenderer.removeListener('tabs:update', listener);
   },
+  // Main asks the UI to focus the address field (Ctrl+L, Alt+D, F6). Returns an unsubscribe function.
+  onFocusAddress: (callback: () => void): (() => void) => {
+    const listener = () => callback();
+    ipcRenderer.on('ui:focus-address', listener);
+    return () => ipcRenderer.removeListener('ui:focus-address', listener);
+  },
 });

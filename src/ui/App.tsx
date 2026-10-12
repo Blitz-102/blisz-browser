@@ -51,6 +51,16 @@ export function App() {
     if (isBlank) addressRef.current?.focus();
   }, [isBlank, tabsState?.activeId]);
 
+  // Ctrl+L, Alt+D and F6 are handled in main, which asks the field to take focus.
+  useEffect(
+    () =>
+      window.bliss.onFocusAddress(() => {
+        addressRef.current?.focus();
+        addressRef.current?.select(); // focus() alone doesn't select when the field already has focus
+      }),
+    [],
+  );
+
   // Tell main where the page goes. While the memory panel is open it takes the page's place.
   useEffect(() => {
     const page = pageRef.current;
