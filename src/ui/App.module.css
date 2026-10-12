@@ -40,8 +40,12 @@
   -webkit-app-region: no-drag;
 }
 
-.iconButton:hover {
+.iconButton:hover:not(:disabled) {
   background: var(--color-surface-hover);
+}
+
+.iconButton:disabled {
+  opacity: var(--disabled-opacity);
 }
 
 .iconButton:focus-visible {

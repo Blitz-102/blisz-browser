@@ -2,6 +2,57 @@
 
 Newest at the top. Each entry: what was chosen, what else was considered, why, and when to revisit.
 
+## 2026-10-12: Page user agent, Chrome UA plus a Blisz token
+- Chosen: `persist:main` uses Electron's Chrome UA with the `Electron/` and npm app-name tokens removed and `Blisz/<version>` appended (built explicitly in `src/main/tabs.ts`).
+- Alternatives considered:
+  - a plain Chrome UA with no extra token (Google rejected it: "This browser or app may not be secure");
+  - faking the Google Chrome brand through CDP (heavy, lost when DevTools opens, and it still fails Google and Cloudflare according to the Orca project's tests);
+  - a different UA only on Google account hosts (more private, more code).
+- Why:
+  - Electron 44 can't change the Client Hints brands, so a UA claiming to be plain Chrome doesn't match the engine. A product token, like Edge's `Edg/`, passes. The user confirmed sign-in works.
+  - The token is unique to this browser, so sites can recognise it. The user accepted that.
+- Revisit if:
+  - Google starts rejecting the token or ends sessions early (then switch to a Google-only UA);
+  - Electron gains `setUserAgentMetadata` (PR #53519);
+  - the unique token becomes a concern.
+  - Changing the UA can sign the user out of Google.
+- Status: provisional
+
+## 2026-10-12: Browser name is Blisz
+- Chosen: user-facing name "Blisz". Legacy identifiers stay: npm package `bliss-browser`, `window.bliss`.
+- Alternatives considered: renaming the package or `productName`.
+- Why: `app.getName()` names the `userData` folder; renaming it would orphan the browsing profile.
+- Revisit if: packaging (Phase 5) sets a product name; then move or migrate `userData` deliberately.
+- Status: settled
+
+## 2026-10-12: Phase 2 core design
+- Chosen:
+  - **Tabs:** a tab manager in `src/main/tabs.ts` is the single source of truth, with integer tab ids. Updates are diff-only and coalesced to one `tabs:update` per ~16 ms.
+  - **Sizes:** the UI reports the page area through `page:set-area`, which main clamps, so `tokens.css` stays the only source of sizes.
+  - **Blank tabs** have no view. Page views are detached while the memory panel shows. A page that closes itself falls back to a blank tab.
+- Alternatives considered: computing the bounds in main from constants (duplicates tokens); keeping a view per blank tab.
+- Why: PLAN 4.1, low memory, and one place to restyle sizes.
+- Revisit if: multiple windows are added (the tab state is single-window today).
+- Status: settled
+
+## 2026-10-12: Page navigation and session security
+- Chosen:
+  - **Page views:** on `persist:main`, sandboxed, context-isolated, no preload, `safeDialogs`, `navigateOnDragDrop: false`, DevTools allowed (user decision).
+  - **Navigation:** main frames are http(s) only, via the shared `isWebUrl`; `tab:navigate` loads the normalized `href`.
+  - **Subframes** of pages use an allow-list: http, https, data, blob, about:blank, about:srcdoc. All subframe navigation in the UI is blocked.
+  - **Client certificates** are never sent automatically. Downloads are cancelled until step 2e.
+- Alternatives considered: a subframe deny-list (misses `ms-msdt:`, `search-ms:` and other protocol-handler schemes).
+- Why: the step 2a security reviews (M1, M2, L1–L4).
+- Revisit if: the permission prompts (2f) change how `openExternal` is handled. They must keep denying it for subframes.
+- Status: settled
+
+## 2026-10-12: Search engine, Google, with suggestions off
+- Chosen: `https://www.google.com/search?q=` in `src/shared/address.ts`. No search suggestions while typing.
+- Alternatives considered: Brave Search, DuckDuckGo; suggestions from the engine's free endpoint.
+- Why: the user's choice. Suggestions would send every keystroke to the engine.
+- Revisit if: the user wants suggestions or a different engine.
+- Status: settled
+
 ## 2026-10-11: Focus the UI view before showing the window
 - Chosen: main calls `uiView.webContents.focus()` just before `window.show()`.
 - Alternatives considered: blurring the focused element from the UI after load; leaving it alone.

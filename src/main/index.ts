@@ -10,9 +10,11 @@ import {
   type WebContents,
   WebContentsView,
 } from 'electron';
+import { isWebUrl } from '../shared/url';
 import { runBench } from './bench';
 import { addTrustedUi, handleFromUi, UI_URL } from './ipc';
 import { getMetrics } from './metrics';
+import { initTabs, isPageContents } from './tabs';
 
 // Native caption buttons via titleBarOverlay (PLAN 4.6); colours come from tokens.css.
 // Fallbacks for --color-frame and --color-text, used only if reading them from the UI fails.
@@ -71,23 +73,44 @@ function addSecurityHeaders(res: Response): Response {
   return new Response(res.body, { status: res.status, headers });
 }
 
-// Phase 2 allows http(s) for page views here, and should also add will-frame-navigate for
-// subframes. For now nothing may navigate.
-function isNavigationAllowed(_contents: Electron.WebContents, _url: string): boolean {
-  return false;
+// Page views may go to http(s) only; trusted UI views may not navigate at all.
+function isNavigationAllowed(contents: Electron.WebContents, url: string): boolean {
+  return isPageContents(contents) && isWebUrl(url);
 }
 
-// Baseline for EVERY webContents. Phase 2 relaxes it for page views through
-// isNavigationAllowed and a per-tab window-open handler; the UI view stays locked.
+// Subframes of page views: an allow-list that includes normal iframes (about:blank, srcdoc, data:, blob:).
+const ALLOWED_FRAME_PROTOCOLS = new Set(['http:', 'https:', 'data:', 'blob:']);
+const ALLOWED_FRAME_ABOUT_URLS = new Set(['about:blank', 'about:srcdoc']);
+
+function isAllowedFrameUrl(url: string): boolean {
+  if (!URL.canParse(url)) return false;
+  const parsed = new URL(url);
+  if (parsed.protocol === 'about:') return ALLOWED_FRAME_ABOUT_URLS.has(`about:${parsed.pathname}`);
+  return ALLOWED_FRAME_PROTOCOLS.has(parsed.protocol);
+}
+
+// Baseline for EVERY webContents; the UI view stays locked. Page views get http(s) navigation
+// through isNavigationAllowed; popups stay denied until the popup step.
 app.on('web-contents-created', (_event, contents) => {
   contents.setWindowOpenHandler(() => ({ action: 'deny' }));
   contents.on('will-attach-webview', (event) => event.preventDefault());
   contents.on('will-navigate', (event) => {
     if (!isNavigationAllowed(contents, event.url)) event.preventDefault();
   });
+  contents.on('will-frame-navigate', (event) => {
+    if (event.isMainFrame) return; // handled by will-navigate
+    if (!isPageContents(contents) || !isAllowedFrameUrl(event.url)) event.preventDefault();
+  });
   contents.on('will-redirect', (event) => {
     if (!isNavigationAllowed(contents, event.url)) event.preventDefault();
   });
+});
+
+// Never send a client certificate automatically: Electron would otherwise pick the first one
+// in the store. Calling back with no certificate continues without one.
+app.on('select-client-certificate', (event, _contents, _url, _list, callback) => {
+  event.preventDefault();
+  callback();
 });
 
 // Deny everything for now; Phase 2 replaces this with per-site prompts (PLAN 4.2, section 7).
@@ -127,6 +150,7 @@ function createWindow(): WebContents {
   });
   addTrustedUi(uiView.webContents);
   window.contentView.addChildView(uiView);
+  initTabs(window, uiView.webContents);
 
   // getContentBounds() is in screen coordinates; the view needs window-relative ones.
   const fitUiView = () => {
