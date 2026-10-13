@@ -2,6 +2,52 @@
 
 Newest at the top. Each entry: what was chosen, what else was considered, why, and when to revisit.
 
+## 2026-10-13: Error cards, fullscreen notice, no certificate bypass
+- Chosen:
+  - **Error cards:**
+    - Main-frame load failures (not aborts) and renderer crashes show a card in the UI's page area, with the page view detached and a "Try again" button.
+    - `ERR_CERT_*` codes get a certificate card.
+    - `certificate-error` always calls `callback(false)`; there is no bypass (user decision).
+  - **HTML fullscreen:**
+    - The page fills the window, after a 3.5 s notice strip ("<origin> is full screen — press Esc to exit").
+    - Electron handles Esc.
+    - Switching tabs exits fullscreen through an isolated-world `document.exitFullscreen()`, with a window-restore fallback after 1 s.
+    - F11 toggles window fullscreen.
+- Alternatives considered: Chromium's own error pages; an overlay view for the notice.
+- Why:
+  - Chromium's error pages can't be styled and show internal URLs.
+  - With no notice, a fullscreen page could draw a fake browser or vault prompt.
+  - A strip costs no extra renderer.
+- Revisit if: the Phase 7 overlay view exists (the notice could float instead of shrinking the page).
+- Status: settled
+
+## 2026-10-13: Permission prompts and external links
+- Chosen:
+  - **Sessions:** `persist:main` gets per-site prompts in the sidebar. Every other session, including the UI's default session, stays deny-all through `session-created`.
+  - **What's asked and what's silent:**
+    - Asked: camera and/or microphone, location, notifications, clipboard-read.
+    - Allowed silently: fullscreen, sanitized clipboard write, pointer lock. These are allowed from cross-origin iframes too, since Permissions Policy gates them.
+    - Denied: everything else, including unknown future permissions, USB, HID, serial, Bluetooth choosers and screen capture.
+  - **Who can be asked:** only https origins (plus http on localhost), and only the tab's current top origin.
+  - **Prompt safety:**
+    - Allow and Block ignore clicks for 500 ms after the prompt appears or the layout changes (clickjacking).
+    - Requests made during HTML fullscreen are denied.
+    - Prompts are cancelled when the tab commits a navigation.
+  - **Remembering:** decisions are remembered per origin for the session; Phase 3 stores them. A clipboard-read Allow is never remembered.
+  - **Notifications:** the prompt warns they appear as coming from Blisz.
+  - **External links:** `mailto:` and `tel:` only. They need a real gesture in the main frame (or same-origin), go through a prompt showing the target, and are rebuilt before opening:
+    - mailto keeps only to, cc, bcc, subject and body, so attach/attachment are dropped;
+    - tel is a strict character set;
+    - quotes, backslashes, angle brackets and spaces are refused.
+  - That is the app's only `shell.openExternal`.
+- Alternatives considered: allow-by-default with a revoke UI; blocking `mailto:` entirely.
+- Why: the step 2f code and security reviews. Mail clients that honour `attach=` with UNC paths can leak the Windows login hash, and tel handlers can take injected arguments.
+- Revisit if:
+  - Phase 3 stores decisions, which needs a way to change a remembered Block;
+  - notifications can be labelled by site.
+- Known gap (still open): popups adopted for `window.opener` lack `safeDialogs`, and Electron has no hook to intercept JS dialogs. Background-tab `alert()` behaviour is to be checked by hand.
+- Status: settled
+
 ## 2026-10-13: Downloads ask where to save, gesture-gated, with an allow-list for Open
 - Chosen:
   - **Saving:** every download on `persist:main` opens the Windows "Save as" dialog (user decision, 2026-10-13). The suggested name is sanitized:

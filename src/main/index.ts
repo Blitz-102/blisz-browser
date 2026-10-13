@@ -16,7 +16,18 @@ import { runBench } from './bench';
 import { initDownloads } from './downloads';
 import { addTrustedUi, handleFromUi, UI_URL } from './ipc';
 import { getMetrics } from './metrics';
-import { getTabProcessLabels, handleShortcuts, initTabs, isPageContents } from './tabs';
+import { denyAllPermissions, installPermissionHandlers } from './permissions';
+import {
+  askPrompt,
+  getTabProcessLabels,
+  handleShortcuts,
+  initTabs,
+  isFullscreen,
+  isPageContents,
+  offerExternalLink,
+  pageDecisions,
+  pageUrl,
+} from './tabs';
 
 // Native caption buttons via titleBarOverlay (PLAN 4.6); colours come from tokens.css.
 // Fallbacks for --color-frame and --color-text, used only if reading them from the UI fails.
@@ -118,8 +129,16 @@ function isAllowedFrameUrl(url: string): boolean {
 app.on('web-contents-created', (_event, contents) => {
   contents.setWindowOpenHandler(() => ({ action: 'deny' }));
   contents.on('will-attach-webview', (event) => event.preventDefault());
+  // Bluetooth pairing is never offered: cancel the chooser with an empty id.
+  contents.on('select-bluetooth-device', (event, _devices, callback) => {
+    event.preventDefault();
+    callback('');
+  });
   contents.on('will-navigate', (event) => {
-    if (!isNavigationAllowed(contents, event.url)) event.preventDefault();
+    if (isNavigationAllowed(contents, event.url)) return;
+    event.preventDefault();
+    // A mailto: or tel: link may ask the user to open their app; any other scheme stays blocked.
+    offerExternalLink(contents, event.url, event.isMainFrame, event.initiator);
   });
   contents.on('will-frame-navigate', (event) => {
     if (event.isMainFrame) return; // handled by will-navigate
@@ -137,12 +156,15 @@ app.on('select-client-certificate', (event, _contents, _url, _list, callback) =>
   callback();
 });
 
-// Deny everything for now; Phase 2 replaces this with per-site prompts (PLAN 4.2, section 7).
-function denyAllPermissions(targetSession: Electron.Session): void {
-  targetSession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
-  targetSession.setPermissionCheckHandler(() => false);
-  targetSession.setDevicePermissionHandler(() => false);
-}
+// A bad certificate fails the load with its ERR_CERT_* code. There is no bypass by design: this
+// never calls callback(true), and the error card offers no "continue anyway".
+app.on('certificate-error', (event, _contents, _url, _error, _certificate, callback) => {
+  event.preventDefault();
+  callback(false);
+});
+
+// Every session starts denying everything, the UI view's included. Wired here so a session
+// created later is covered too; the page session is then given prompts in createWindow.
 app.on('session-created', denyAllPermissions);
 
 function createWindow(): WebContents {
@@ -175,6 +197,11 @@ function createWindow(): WebContents {
   addTrustedUi(uiView.webContents);
   window.contentView.addChildView(uiView);
   const pageSession = initTabs(window, uiView.webContents);
+  installPermissionHandlers(
+    pageSession,
+    { topUrl: pageUrl, isFullscreen, ask: askPrompt },
+    pageDecisions,
+  );
   initDownloads(uiView.webContents, pageSession, saveDownloadsWithoutPrompt);
   handleShortcuts(uiView.webContents);
 

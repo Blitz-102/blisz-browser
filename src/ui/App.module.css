@@ -6,6 +6,31 @@
   background: var(--color-frame);
 }
 
+/* Shown in the strip the page leaves free for a few seconds after it goes fullscreen. */
+.fullscreenNotice {
+  position: fixed;
+  inset: 0 0 auto;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: var(--titlebar-height);
+  margin: 0;
+  padding: 0 var(--space-3);
+  white-space: nowrap;
+  background: var(--color-frame);
+  color: var(--color-text);
+  font-size: var(--font-size-md);
+}
+
+/* A long origin is clipped so the hint stays visible. */
+.fullscreenOrigin {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .sidebar {
   display: flex;
   flex: none;

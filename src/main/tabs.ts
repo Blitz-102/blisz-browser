@@ -3,17 +3,22 @@ import {
   type BaseWindow,
   type HandlerDetails,
   session,
+  shell,
   type WebContents,
   WebContentsView,
+  type WebFrameMain,
   type WindowOpenHandlerResponse,
 } from 'electron';
 import { toNavigableUrl } from '../shared/address';
 import { BIDI_CONTROLS } from '../shared/bidi';
+import { loadError } from '../shared/tabError';
 import type {
   FindOptions,
   FindResult,
   PageArea,
+  PromptKind,
   TabAction,
+  TabError,
   TabInfo,
   TabsState,
   TabsUpdate,
@@ -23,6 +28,7 @@ import { isWebUrl } from '../shared/url';
 import { popupPageMenu, popupTabMenu } from './contextMenu';
 import { fetchFavicon, webFaviconUrls } from './favicon';
 import { handleFromUi } from './ipc';
+import { DecisionStore, isExternalKind, PromptQueue, parseExternalLink } from './permissions';
 import { matchShortcut, type ShortcutAction } from './shortcuts';
 
 // The one place the page session is named. The UI view uses the default session, which is the
@@ -69,6 +75,19 @@ const DOWNLOAD_INPUT_MS = 5000;
 const DOWNLOAD_LIMIT = 3;
 const DOWNLOAD_WINDOW_MS = 10_000;
 const SAVE_AS_ALLOWANCE_MS = 5000;
+// A mailto: or tel: link needs a real click or key this recent. Showing the prompt uses the gesture up.
+const EXTERNAL_LINK_INPUT_MS = 5000;
+// HTML fullscreen: for the first moments the top of the window stays outside the page so the UI can
+// say which site is fullscreen and how to leave. The height is --titlebar-height in tokens.css.
+const FULLSCREEN_NOTICE_MS = 3500;
+const FULLSCREEN_NOTICE_HEIGHT = 40;
+// If the page doesn't leave fullscreen when asked, the window is restored after this long.
+const FULLSCREEN_EXIT_FALLBACK_MS = 1000;
+// Allow and Block ignore clicks this soon after a prompt appears or the page area moves, so a page
+// can't slide something under a click aimed at the page.
+const PROMPT_CLICK_DELAY_MS = 500;
+// Isolated world for main's own scripts, out of reach of the page's (it can't override what they call).
+const MAIN_WORLD_ID = 999;
 const MAX_FIND_LENGTH = 1000;
 // Chrome's zoom steps. Same-origin tabs share one zoom (Chromium's default policy).
 const ZOOM_STEPS = [
@@ -83,6 +102,10 @@ interface Tab {
   faviconKey: string; // the candidates being fetched or already shown, to skip repeated events
   faviconFetch: AbortController | null;
   htmlFullscreen: boolean; // Esc leaves HTML fullscreen, so it must reach the page
+  fullscreenNotice: string | null; // origin shown in the notice strip while it is up
+  noticeTimer: NodeJS.Timeout | undefined;
+  prompts: PromptQueue; // questions for the user, such as a camera request, oldest first
+  error: TabError | null; // why the page can't be shown; the UI shows a card instead of the view
   opener: Tab | null; // the tab that opened this one as a popup
   recentPopups: number[]; // times this tab opened popups, newest last
   blockedPopups: number; // reset on main-frame navigation
@@ -104,6 +127,15 @@ interface Insets {
   radius: number;
   hidden: boolean;
 }
+
+// HTML fullscreen: the page fills the window, with no insets or rounded corners. During the notice
+// the top strip is left free.
+const FULL_WINDOW: Insets = { left: 0, top: 0, right: 0, bottom: 0, radius: 0, hidden: false };
+const NOTICE_WINDOW: Insets = { ...FULL_WINDOW, top: FULLSCREEN_NOTICE_HEIGHT };
+
+export const pageDecisions = new DecisionStore(); // answers for the page session
+let promptReadyAt = 0; // clicks on a prompt count after this time
+let userFullscreen = false; // the user made the window fullscreen with F11
 
 const tabs: Tab[] = []; // sidebar order
 const pageContents = new WeakSet<WebContents>();
@@ -273,6 +305,100 @@ function handleWindowOpen(
   };
 }
 
+function findPageTab(contents: WebContents): Tab | undefined {
+  return tabs.find((tab) => tab.view?.webContents === contents);
+}
+
+// The page's top-level URL, or null when `contents` is not a page tab (such as the UI view).
+export function pageUrl(contents: WebContents): string | null {
+  return findPageTab(contents) ? contents.getURL() : null;
+}
+
+export function isFullscreen(contents: WebContents): boolean {
+  return findPageTab(contents)?.htmlFullscreen ?? false;
+}
+
+function delayPromptClicks(): void {
+  promptReadyAt = Date.now() + PROMPT_CLICK_DELAY_MS;
+}
+
+function originOfUrl(url: string): string | null {
+  return isWebUrl(url) ? new URL(url).origin : null;
+}
+
+// Shows a question under the address field. Resolves with the user's answer, or false when the
+// tab navigates, closes or crashes first. The callback never leaves main.
+export function askPrompt(
+  contents: WebContents,
+  kind: PromptKind,
+  origin: string,
+  target = '',
+): Promise<boolean> {
+  const tab = findPageTab(contents);
+  return new Promise((resolve) => {
+    if (!tab) {
+      resolve(false);
+      return;
+    }
+    const shown = tab.prompts.current;
+    tab.prompts.add(kind, origin, resolve, target);
+    // Only a different question on screen re-arms the delay, not a merged or refused request.
+    if (tab.prompts.current !== shown) delayPromptClicks();
+    queueUpdate(tab.id);
+  });
+}
+
+// A mailto: or tel: navigation stopped by the page guard. With a recent real click or key in the
+// page itself (the main frame, or a same-origin frame), the user is asked, and the gesture is used
+// up. Opening the app happens only after Allow, with the rebuilt link.
+export function offerExternalLink(
+  contents: WebContents,
+  url: string,
+  isMainFrame: boolean,
+  initiator: WebFrameMain | null | undefined,
+): void {
+  const tab = findPageTab(contents);
+  const link = parseExternalLink(url);
+  const origin = originOfUrl(contents.getURL());
+  const { mainFrame } = contents;
+  if (
+    !tab ||
+    !link ||
+    !origin ||
+    !isMainFrame ||
+    !initiator ||
+    (initiator !== mainFrame &&
+      (initiator.origin === 'null' || initiator.origin !== mainFrame.origin)) ||
+    tab.htmlFullscreen ||
+    Date.now() - tab.lastInputAt >= EXTERNAL_LINK_INPUT_MS ||
+    tab.prompts.has(link.kind) // one question at a time per kind
+  ) {
+    return;
+  }
+  tab.lastInputAt = 0;
+  askPrompt(contents, link.kind, origin, link.target).then((allow) => {
+    // This is the only shell.openExternal call in the app. Checked again at the moment of opening.
+    const checked = allow ? parseExternalLink(link.url) : null;
+    if (checked) shell.openExternal(checked.url).catch(() => {});
+  });
+}
+
+// Answers the oldest question of the tab that shows it. Too soon after it appeared, Allow is
+// ignored (Block is harmless, so it always works). If the tab has since moved to another site, the answer is Block and is not remembered.
+function respondToPrompt(id: number, allow: boolean): void {
+  const tab = tabs.find((other) => other.prompts.current?.id === id);
+  const prompt = tab?.prompts.current;
+  if (!tab || !prompt || (allow && Date.now() < promptReadyAt)) return;
+  const sameSite =
+    tab.view !== null && originOfUrl(tab.view.webContents.getURL()) === prompt.origin;
+  tab.prompts.respond(id, allow && sameSite);
+  if (sameSite && !isExternalKind(prompt.kind)) {
+    pageDecisions.remember(prompt.origin, prompt.kind, allow);
+  }
+  if (tab.prompts.current) delayPromptClicks(); // the next question appears in its place
+  queueUpdate(tab.id);
+}
+
 function readInfo(tab: Tab): TabInfo {
   if (!tab.view) {
     return {
@@ -286,6 +412,9 @@ function readInfo(tab: Tab): TabInfo {
       blockedPopups: 0,
       blockedDownloads: 0,
       zoom: 1,
+      prompt: null,
+      fullscreenNotice: null,
+      error: null,
     };
   }
   const contents = tab.view.webContents;
@@ -300,6 +429,9 @@ function readInfo(tab: Tab): TabInfo {
     blockedPopups: tab.blockedPopups,
     blockedDownloads: tab.blockedDownloads,
     zoom: Math.round(contents.getZoomFactor() * 100) / 100,
+    prompt: tab.prompts.current,
+    fullscreenNotice: tab.fullscreenNotice,
+    error: tab.error,
   };
 }
 
@@ -351,14 +483,22 @@ function findTab(id: number): Tab | undefined {
 // A view removed from the window is hidden by Chromium, which then throttles that tab (PLAN 4.1).
 function detachView(): void {
   if (!attachedView) return;
+  delayPromptClicks();
   window.contentView.removeChildView(attachedView);
   attachedView = null;
 }
 
 // Attaches the active page view in the page area, or detaches it when the UI covers that area.
 function layout(): void {
-  const view = findTab(activeId)?.view ?? null;
-  if (!view || !insets || insets.hidden) {
+  const tab = findTab(activeId);
+  const view = tab?.view ?? null;
+  if (view && tab?.error) {
+    detachView(); // the UI shows an error card in the page area
+    return;
+  }
+  let area = insets;
+  if (tab?.htmlFullscreen) area = tab.fullscreenNotice === null ? FULL_WINDOW : NOTICE_WINDOW;
+  if (!view || !area || area.hidden) {
     detachView();
     focusOnAttach = false; // closing the memory panel later must not make the page take focus
     return;
@@ -369,13 +509,23 @@ function layout(): void {
     attachedView = view;
   }
   const { width, height } = window.getContentBounds();
-  view.setBounds({
-    x: insets.left,
-    y: insets.top,
-    width: Math.max(0, width - insets.left - insets.right),
-    height: Math.max(0, height - insets.top - insets.bottom),
-  });
-  view.setBorderRadius(insets.radius);
+  const bounds = {
+    x: area.left,
+    y: area.top,
+    width: Math.max(0, width - area.left - area.right),
+    height: Math.max(0, height - area.top - area.bottom),
+  };
+  const current = view.getBounds();
+  if (
+    bounds.x !== current.x ||
+    bounds.y !== current.y ||
+    bounds.width !== current.width ||
+    bounds.height !== current.height
+  ) {
+    delayPromptClicks();
+  }
+  view.setBounds(bounds);
+  view.setBorderRadius(area.radius);
   if (focusOnAttach) {
     focusOnAttach = false;
     view.webContents.focus();
@@ -405,7 +555,26 @@ function watchPageEvents(tab: Tab, contents: WebContents): void {
   const onChange = () => queueUpdate(tab.id);
   contents.on('did-start-loading', onChange);
   contents.on('did-stop-loading', onChange);
+  // A new page load drops the old error.
+  contents.on('did-start-navigation', (details) => {
+    if (!details.isMainFrame || details.isSameDocument) return;
+    setError(tab, null);
+    onChange();
+  });
+  contents.on('did-fail-load', (_event, code, description, url, isMainFrame) => {
+    const error = isMainFrame ? loadError(code, description, url) : null; // a trailing -3 changes nothing
+    if (error) setError(tab, error);
+  });
+  contents.on('render-process-gone', (_event, details) => {
+    if (details.reason === 'clean-exit') return;
+    tab.prompts.cancelAll();
+    dropHtmlFullscreen(tab);
+    setError(tab, { kind: 'crashed' });
+    onChange();
+  });
   contents.on('did-navigate', () => {
+    tab.prompts.cancelAll(); // questions belong to the page that asked
+    setError(tab, null);
     resetFavicon(tab);
     tab.blockedPopups = 0;
     tab.blockedDownloads = 0;
@@ -418,11 +587,23 @@ function watchPageEvents(tab: Tab, contents: WebContents): void {
   contents.on('did-navigate-in-page', onChange);
   contents.on('page-title-updated', onChange);
   contents.on('enter-html-full-screen', () => {
-    tab.htmlFullscreen = true;
+    if (tab.id !== activeId) {
+      requestExitFullscreen(contents); // only the tab in view may take over the window
+      restoreWindowSoon();
+      return;
+    }
+    tab.htmlFullscreen = true; // Electron has already made the window fullscreen
+    tab.fullscreenNotice = originOfUrl(contents.getURL()) ?? 'This page';
+    clearTimeout(tab.noticeTimer);
+    tab.noticeTimer = setTimeout(() => {
+      tab.fullscreenNotice = null;
+      queueUpdate(tab.id);
+      layout();
+    }, FULLSCREEN_NOTICE_MS);
+    queueUpdate(tab.id);
+    layout();
   });
-  contents.on('leave-html-full-screen', () => {
-    tab.htmlFullscreen = false;
-  });
+  contents.on('leave-html-full-screen', () => leaveHtmlFullscreen(tab));
   contents.on('page-favicon-updated', (_event, favicons) => {
     loadFavicon(tab, webFaviconUrls(favicons));
   });
@@ -446,6 +627,55 @@ function watchPageEvents(tab: Tab, contents: WebContents): void {
     tab.view = null;
     closeTab(tab);
   });
+}
+
+function setError(tab: Tab, error: TabError | null): void {
+  if (tab.error === error) return;
+  tab.error = error;
+  queueUpdate(tab.id);
+  if (tab.id === activeId) layout();
+}
+
+// Puts the page area back after HTML fullscreen. Electron itself leaves window fullscreen when the
+// page leaves HTML fullscreen (Esc included). Safe to call when not in it.
+function leaveHtmlFullscreen(tab: Tab): void {
+  if (!tab.htmlFullscreen) return;
+  tab.htmlFullscreen = false;
+  clearTimeout(tab.noticeTimer);
+  tab.fullscreenNotice = null;
+  queueUpdate(tab.id);
+  layout();
+}
+
+// For a page that can no longer say it left (closed or crashed): no leave event will come, so the
+// window is restored here, unless the user chose fullscreen with F11.
+function dropHtmlFullscreen(tab: Tab): void {
+  if (!tab.htmlFullscreen) return;
+  if (!userFullscreen) window.setFullScreen(false);
+  leaveHtmlFullscreen(tab);
+}
+
+function exitHtmlFullscreen(tab: Tab): void {
+  if (!tab.htmlFullscreen) return;
+  if (tab.view) requestExitFullscreen(tab.view.webContents);
+  leaveHtmlFullscreen(tab);
+  restoreWindowSoon();
+}
+
+// Electron has no webContents.exitFullscreen(), so the page is asked, from an isolated world so
+// that the page can't replace what is called.
+function requestExitFullscreen(contents: WebContents): void {
+  contents
+    .executeJavaScriptInIsolatedWorld(MAIN_WORLD_ID, [{ code: 'void document.exitFullscreen()' }])
+    .catch(() => {});
+}
+
+// Backup for a page that never leaves fullscreen: the window is restored anyway.
+function restoreWindowSoon(): void {
+  setTimeout(() => {
+    if (window.isDestroyed() || userFullscreen || tabs.some((tab) => tab.htmlFullscreen)) return;
+    window.setFullScreen(false);
+  }, FULLSCREEN_EXIT_FALLBACK_MS);
 }
 
 // Cancels a fetch in flight and forgets the favicon (navigation, close, page gone).
@@ -496,6 +726,10 @@ function addTab(index: number): Tab {
     faviconKey: '',
     faviconFetch: null,
     htmlFullscreen: false,
+    fullscreenNotice: null,
+    noticeTimer: undefined,
+    prompts: new PromptQueue(),
+    error: null,
     opener: null,
     recentPopups: [],
     blockedPopups: 0,
@@ -515,7 +749,11 @@ function addTab(index: number): Tab {
 
 // A tab with a page gets focus once its view is attached; a blank tab hands focus to the address field.
 function activateTab(tab: Tab): void {
-  if (tab.id !== activeId) closeFind();
+  if (tab.id !== activeId) {
+    closeFind();
+    const previous = findTab(activeId);
+    if (previous) exitHtmlFullscreen(previous);
+  }
   activeId = tab.id;
   queueStructureUpdate();
   if (tab.view) focusOnAttach = true;
@@ -542,6 +780,8 @@ function closeTab(tab: Tab): void {
   lastSent.delete(tab.id);
   queueStructureUpdate();
   tab.faviconFetch?.abort();
+  tab.prompts.cancelAll();
+  dropHtmlFullscreen(tab);
   if (tab.view) {
     if (attachedView === tab.view) detachView();
     if (!tab.view.webContents.isDestroyed()) tab.view.webContents.close();
@@ -691,6 +931,14 @@ function runShortcut(action: ShortcutAction): void {
       active?.view?.webContents.setZoomFactor(1);
       queueZoomUpdates();
       break;
+    case 'toggle-fullscreen':
+      // F11 in HTML fullscreen leaves it; otherwise it toggles the window.
+      if (active?.htmlFullscreen) exitHtmlFullscreen(active);
+      else {
+        userFullscreen = !window.isFullScreen();
+        window.setFullScreen(userFullscreen);
+      }
+      break;
   }
 }
 
@@ -801,6 +1049,10 @@ export function initTabs(appWindow: BaseWindow, uiContents: WebContents): Electr
       },
     });
   });
+  handleFromUi('prompts:respond', (_event, id, allow) => {
+    if (!Number.isInteger(id) || typeof allow !== 'boolean') throw new Error('Bad prompt answer');
+    respondToPrompt(id as number, allow);
+  });
   handleFromUi('tab:reset-zoom', (_event, id) => {
     getTab(id).view?.webContents.setZoomFactor(1);
     queueZoomUpdates();
@@ -843,10 +1095,14 @@ export function initTabs(appWindow: BaseWindow, uiContents: WebContents): Electr
   });
   // Recompute at once instead of waiting for the UI to report the new size.
   window.on('resize', layout);
+  window.on('leave-full-screen', () => {
+    userFullscreen = false;
+  });
   // WebContentsView contents are not destroyed with the window.
   window.on('closed', () => {
     clearTimeout(flushTimer);
     for (const tab of tabs) {
+      tab.prompts.cancelAll();
       if (tab.view && !tab.view.webContents.isDestroyed()) tab.view.webContents.close();
     }
   });

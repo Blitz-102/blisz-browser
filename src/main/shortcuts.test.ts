@@ -67,6 +67,13 @@ describe('matchShortcut', () => {
     expect(matchShortcut(press('ArrowLeft', { alt: true, shift: true }))).toBeNull();
   });
 
+  it('toggles window fullscreen on a plain F11', () => {
+    expect(matchShortcut(press('F11'))).toBe('toggle-fullscreen');
+    expect(matchShortcut(press('F11', { shift: true }))).toBeNull();
+    expect(matchShortcut(press('F11', { control: true }))).toBeNull();
+    expect(matchShortcut(press('F11', { alt: true }))).toBeNull();
+  });
+
   it('keeps F12 for the page and the UI DevTools on Ctrl+Shift+Alt+I', () => {
     expect(matchShortcut(press('F12'))).toBe('toggle-devtools');
     expect(matchShortcut(press('I', { control: true, shift: true }))).toBe('toggle-devtools');

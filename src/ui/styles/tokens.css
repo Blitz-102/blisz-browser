@@ -4,6 +4,7 @@
   /* Main reads the body background and text colour (global.css sets them from --color-frame and --color-text) for the window chrome, so keep both opaque sRGB (hex, rgb() or hsl()). */
   --color-frame: hsl(42, 15%, 87%);
   --color-accent: #2f7a62;
+  --color-on-accent: #ffffff;
   --color-text: #1f2a26;
   --color-text-muted: #56655e;
   --color-surface: #ffffff;
@@ -48,6 +49,7 @@
   --icon-stroke-width: 1.75;
   --pinned-tile-size: 46px;
   --favicon-size: 18px;
+  --card-max-width: 420px;
 
   /* Loading indicator */
   --spinner-size: 14px;

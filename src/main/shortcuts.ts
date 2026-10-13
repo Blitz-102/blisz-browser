@@ -19,6 +19,7 @@ export type ShortcutAction =
   | 'zoom-in'
   | 'zoom-out'
   | 'zoom-reset'
+  | 'toggle-fullscreen'
   | { selectTab: number }; // 1-based position in sidebar order
 
 // The part of Electron's Input that matching needs.
@@ -94,6 +95,7 @@ export function matchShortcut(input: ShortcutInput): ShortcutAction | null {
   if (key === 'F3') return shift ? 'find-previous' : 'find-next';
   if (shift) return null;
   if (key === 'F6') return 'focus-address';
+  if (key === 'F11') return 'toggle-fullscreen';
   if (key === 'F12') return 'toggle-devtools';
   if (key === 'Escape') return 'stop';
   return null;

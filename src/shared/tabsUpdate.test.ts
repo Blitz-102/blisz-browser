@@ -13,6 +13,9 @@ const tab: TabInfo = {
   blockedPopups: 0,
   blockedDownloads: 0,
   zoom: 1,
+  prompt: null,
+  fullscreenNotice: null,
+  error: null,
 };
 
 const state: TabsState = { activeId: 1, order: [1, 2], tabs: [tab, { ...tab, id: 2 }] };
@@ -43,6 +46,38 @@ describe('diffTabInfo', () => {
       blockedPopups: 2,
       zoom: 1.1,
     });
+  });
+});
+
+describe('prompt and error', () => {
+  const prompt = { id: 1, kind: 'camera', origin: 'https://example.com', target: '' } as const;
+  const error = {
+    kind: 'network',
+    code: -102,
+    description: 'ERR_CONNECTION_REFUSED',
+    url: 'http://example.com/',
+  } as const;
+
+  it('reports a prompt or error appearing and clearing', () => {
+    expect(diffTabInfo(tab, { ...tab, prompt })).toEqual({ prompt });
+    expect(diffTabInfo({ ...tab, prompt }, tab)).toEqual({ prompt: null });
+    expect(diffTabInfo(tab, { ...tab, error })).toEqual({ error });
+    expect(diffTabInfo({ ...tab, error }, tab)).toEqual({ error: null });
+  });
+
+  it('applies and clears them in the state', () => {
+    const shown = applyTabsUpdate(state, {
+      activeId: 1,
+      order: [1, 2],
+      tabs: { 1: { prompt, error: { kind: 'crashed' } } },
+    });
+    expect(shown.tabs[0]).toMatchObject({ prompt, error: { kind: 'crashed' } });
+    const cleared = applyTabsUpdate(shown, {
+      activeId: 1,
+      order: [1, 2],
+      tabs: { 1: { prompt: null, error: null } },
+    });
+    expect(cleared.tabs[0]).toMatchObject({ prompt: null, error: null });
   });
 });
 

@@ -17,6 +17,7 @@ interface Window {
     navigateTab(id: number, input: string): Promise<boolean>;
     tabGo(id: number, action: import('../shared/tabs').TabAction): Promise<void>;
     resetZoom(id: number): Promise<void>;
+    respondToPrompt(id: number, allow: boolean): Promise<void>;
     findQuery(
       id: number,
       text: string,

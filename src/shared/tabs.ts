@@ -1,3 +1,27 @@
+// What a page asks the user about. The first six are permissions; the last two are mailto:/tel: links.
+export type PromptKind =
+  | 'camera'
+  | 'microphone'
+  | 'camera-microphone'
+  | 'location'
+  | 'notifications'
+  | 'clipboard-read'
+  | 'open-mail'
+  | 'open-phone';
+
+// The question shown to the user. `origin` is the page's origin and is shown as text only.
+export interface PromptInfo {
+  id: number;
+  kind: PromptKind;
+  origin: string;
+  target: string; // for mail and phone links, the address or number; otherwise empty
+}
+
+// Why the page can't be shown. Text fields are untrusted and shown as text only.
+export type TabError =
+  | { kind: 'network' | 'certificate'; code: number; description: string; url: string }
+  | { kind: 'crashed' };
+
 export interface TabInfo {
   id: number;
   url: string; // empty while the tab is blank (no page view yet)
@@ -9,6 +33,9 @@ export interface TabInfo {
   blockedPopups: number; // popups denied since the last main-frame navigation
   blockedDownloads: number; // downloads denied since the last main-frame navigation
   zoom: number; // zoom factor, 1 = 100%
+  prompt: PromptInfo | null; // the oldest pending question; the rest of the queue stays in main
+  fullscreenNotice: string | null; // origin of a page that just went fullscreen, for a few seconds
+  error: TabError | null; // set while the page failed to load or crashed; the UI shows a card instead
 }
 
 export interface TabsState {

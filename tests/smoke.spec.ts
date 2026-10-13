@@ -7,6 +7,7 @@ import {
   type ElectronApplication,
   _electron as electron,
   expect,
+  type Locator,
   type Page,
   test,
 } from '@playwright/test';
@@ -1199,6 +1200,312 @@ test('"Save link as" downloads a linked file without a click', async () => {
         ?.downloadURL(`${url}report.zip`);
     }, home);
     await expect(ui.getByText('Download blocked')).toBeVisible();
+  } finally {
+    await close();
+  }
+});
+
+// Step 2f: permissions, external links, error cards and fullscreen.
+const PROMPT_PAGES: Record<string, string> = {
+  '/': `<title>Fixture prompts</title>
+    <button id="cam" onclick="ask()">Camera</button>
+    <button id="full" onclick="document.documentElement.requestFullscreen()">Fullscreen</button>
+    <a href="mailto:test@example.com?subject=Hi">Mail</a> <a href="tel:+15551234567">Call</a>
+    <a href="/next">Next</a>
+    <iframe src="/frame" title="frame"></iframe>
+    <script>
+      let count = 0;
+      function ask() {
+        const n = ++count;
+        navigator.mediaDevices.getUserMedia({ video: true }).then(
+          () => { document.title = 'cam:allowed:' + n; },
+          (error) => { document.title = 'cam:' + error.name + ':' + n; },
+        );
+      }
+    </script>`,
+  '/next': '<title>Fixture next</title><p>Next</p>',
+  '/frame': `<a href="mailto:frame@example.com"
+    onclick="setTimeout(() => { parent.document.title = 'frame clicked' }, 50)">Frame mail</a>`,
+  '/auto': `<title>Fixture auto</title><script>setTimeout(() => {
+    location.href = 'mailto:auto@example.com';
+    document.title = 'Fixture auto done';
+  }, 100)</script>`,
+};
+
+// Allow and Block ignore clicks for half a second after a prompt shows, so click until it closes.
+async function answerPrompt(prompt: Locator, name: RegExp) {
+  await expect(async () => {
+    if ((await prompt.count()) === 0) return;
+    await prompt.getByRole('button', { name }).click({ timeout: 1000 });
+    await expect(prompt).toHaveCount(0, { timeout: 300 });
+  }).toPass();
+}
+
+// Clicks a link (in the page or one of its frames) by its text. Main blocks these navigations, and
+// Playwright's own click would wait for them to finish.
+async function clickBlockedLink(view: Page, text: string) {
+  for (const frame of view.frames()) {
+    // The test tsconfig has no DOM types, so the page code is a string.
+    const center = await frame.evaluate<{ x: number; y: number } | null>(`(() => {
+      const link = [...document.querySelectorAll('a')].find((a) => a.textContent === ${JSON.stringify(text)});
+      if (!link) return null;
+      const box = link.getBoundingClientRect();
+      const offset = window.frameElement?.getBoundingClientRect(); // same-origin fixture frames
+      return { x: box.x + box.width / 2 + (offset?.x ?? 0), y: box.y + box.height / 2 + (offset?.y ?? 0) };
+    })()`);
+    if (center) {
+      await view.mouse.click(center.x, center.y);
+      return;
+    }
+  }
+  throw new Error(`Link not found: ${text}`);
+}
+
+async function openPromptSession() {
+  const server = createServer((request, response) => {
+    response.setHeader('Content-Type', 'text/html');
+    response.end(PROMPT_PAGES[request.url ?? '/'] ?? PROMPT_PAGES['/']);
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const home = `http://127.0.0.1:${(server.address() as AddressInfo).port}/`;
+  const app = await launch().catch((error) => {
+    server.close();
+    throw error;
+  });
+  const close = async () => {
+    await app.close();
+    server.closeAllConnections();
+    server.close();
+  };
+  try {
+    const ui = await findUi(app);
+    const pageAt = (url: string) => {
+      const view = app.windows().find((window) => window.url() === url);
+      if (!view) throw new Error(`Page view not found at ${url}`);
+      return view;
+    };
+    const address = ui.getByRole('textbox', { name: 'Address' });
+    await address.fill(home);
+    await address.press('Enter');
+    await expect(ui.locator('[aria-current="page"]')).toContainText('Fixture prompts');
+    return { app, ui, home, pageAt, address, close };
+  } catch (error) {
+    await close();
+    throw error;
+  }
+}
+
+test('a camera request asks, Block is remembered, and a new page cancels a pending prompt', async () => {
+  const { app, ui, home, pageAt, close } = await openPromptSession();
+  try {
+    const prompt = ui.getByRole('region', { name: 'Permission request' });
+    await expect(prompt).toHaveCount(0);
+
+    // The UI view's own session still denies everything.
+    expect(
+      await ui.evaluate(
+        "navigator.mediaDevices.getUserMedia({ video: true }).then(() => 'allowed', (e) => e.name)",
+      ),
+    ).toBe('NotAllowedError');
+
+    await pageAt(home).getByRole('button', { name: 'Camera' }).click();
+    await expect(prompt).toContainText(`${home.slice(0, -1)} wants to use your camera`);
+    // The prompt does not take the keyboard focus from the page.
+    expect(
+      await app.evaluate(({ webContents }) =>
+        webContents
+          .getAllWebContents()
+          .find((c) => c.getURL().startsWith('blisz://'))
+          ?.isFocused(),
+      ),
+    ).toBe(false);
+    await answerPrompt(prompt, /^Block /);
+    await expect.poll(() => pageAt(home).evaluate('document.title')).toBe('cam:NotAllowedError:1');
+    await expect(prompt).toHaveCount(0);
+
+    // Block was remembered: the second request fails without a prompt.
+    await pageAt(home).getByRole('button', { name: 'Camera' }).click();
+    await expect.poll(() => pageAt(home).evaluate('document.title')).toBe('cam:NotAllowedError:2');
+    await expect(prompt).toHaveCount(0);
+
+    // A question waits for an answer, and a new page drops it.
+    await pageAt(home).evaluate('navigator.geolocation.getCurrentPosition(() => {}, () => {})');
+    await expect(prompt).toContainText('wants to know your location');
+    await expect(prompt.getByRole('button', { name: /^Allow / })).toBeVisible();
+    await pageAt(home).getByRole('link', { name: 'Next' }).click();
+    await expect(prompt).toHaveCount(0);
+  } finally {
+    await close();
+  }
+});
+
+test('mailto: and tel: links ask first, open only on Allow, and are blocked without a click or from a frame', async () => {
+  const { app, ui, home, pageAt, address, close } = await openPromptSession();
+  try {
+    await app.evaluate(({ shell }) => {
+      const calls: string[] = [];
+      (globalThis as unknown as { externalCalls: string[] }).externalCalls = calls;
+      shell.openExternal = async (url) => {
+        calls.push(url);
+      };
+    });
+    const externalCalls = () =>
+      app.evaluate(() => (globalThis as unknown as { externalCalls: string[] }).externalCalls);
+    const prompt = ui.getByRole('region', { name: 'Permission request' });
+
+    await clickBlockedLink(pageAt(home), 'Mail');
+    await expect(prompt).toContainText('wants to open your mail app: test@example.com');
+    expect(await externalCalls()).toEqual([]);
+    await answerPrompt(prompt, /^Allow /);
+    await expect.poll(externalCalls).toEqual(['mailto:test@example.com?subject=Hi']);
+    await expect(prompt).toHaveCount(0);
+    await expect(address).toHaveValue(home); // the tab stayed on the page
+
+    await clickBlockedLink(pageAt(home), 'Call');
+    await expect(prompt).toContainText('wants to open your phone app: +15551234567');
+    await answerPrompt(prompt, /^Block /);
+
+    // A link inside a frame never asks; the frame page reports the click, so nothing is waited for blindly.
+    await clickBlockedLink(pageAt(home), 'Frame mail');
+    await expect.poll(() => pageAt(home).evaluate('document.title')).toBe('frame clicked');
+    await expect(prompt).toHaveCount(0);
+    expect(await externalCalls()).toEqual(['mailto:test@example.com?subject=Hi']);
+
+    // A script navigating to mailto: without any click never asks.
+    await address.fill(`${home}auto`);
+    await address.press('Enter');
+    await expect(ui.locator('[aria-current="page"]')).toContainText('Fixture auto');
+    await expect
+      .poll(() => pageAt(`${home}auto`).evaluate('document.title'))
+      .toBe('Fixture auto done');
+    await expect(prompt).toHaveCount(0);
+    expect(await externalCalls()).toEqual(['mailto:test@example.com?subject=Hi']);
+  } finally {
+    await close();
+  }
+});
+
+test('a page that cannot be reached shows an error card, and Try again works once it is back', async () => {
+  const server = createServer((_request, response) => {
+    response.setHeader('Content-Type', 'text/html');
+    response.end('<title>Fixture back</title><p>Back</p>');
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address() as AddressInfo;
+  const url = `http://127.0.0.1:${port}/`;
+  const app = await launch();
+  try {
+    const ui = await findUi(app);
+    const address = ui.getByRole('textbox', { name: 'Address' });
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+
+    await address.fill(url);
+    await address.press('Enter');
+    const card = ui.getByRole('region', { name: "Can't reach this page" });
+    await expect(card).toBeVisible();
+    await expect(card).toContainText('ERR_CONNECTION_REFUSED');
+    await expect(card).toContainText(url);
+
+    await new Promise<void>((resolve) => server.listen(port, '127.0.0.1', resolve));
+    await card.getByRole('button', { name: 'Try again' }).click();
+    await expect(ui.locator('[aria-current="page"]')).toContainText('Fixture back');
+    await expect(card).toHaveCount(0);
+  } finally {
+    await app.close();
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
+test('a crashed tab shows a crashed card, and Try again recovers it', async () => {
+  const { app, ui, home, close } = await openPromptSession();
+  try {
+    await app.evaluate(({ webContents }, url) => {
+      webContents
+        .getAllWebContents()
+        .find((c) => c.getURL() === url)
+        ?.forcefullyCrashRenderer();
+    }, home);
+    const card = ui.getByRole('region', { name: 'This tab crashed' });
+    await expect(card).toBeVisible();
+    await card.getByRole('button', { name: 'Try again' }).click();
+    await expect(card).toHaveCount(0);
+    await expect(ui.locator('[aria-current="page"]')).toContainText('Fixture prompts');
+  } finally {
+    await close();
+  }
+});
+
+async function windowState(app: ElectronApplication, url: string) {
+  return app.evaluate(({ BaseWindow }, url) => {
+    const window = BaseWindow.getAllWindows()[0];
+    if (!window) throw new Error('No window');
+    const view = window.contentView.children.find((child) =>
+      (child as unknown as { webContents?: Electron.WebContents }).webContents
+        ?.getURL()
+        .startsWith(url),
+    );
+    return {
+      fullScreen: window.isFullScreen(),
+      content: window.getContentBounds(),
+      view: view?.getBounds() ?? null,
+    };
+  }, url);
+}
+
+test('HTML fullscreen fills the window; Esc, a tab switch and F11 put things back', async () => {
+  const { app, ui, home, pageAt, close } = await openPromptSession();
+  try {
+    const before = await windowState(app, home);
+    expect(before.fullScreen).toBe(false);
+    expect(before.view).not.toBeNull();
+
+    // Esc leaves HTML fullscreen.
+    await pageAt(home).getByRole('button', { name: 'Fullscreen' }).click();
+    await expect.poll(async () => (await windowState(app, home)).fullScreen).toBe(true);
+    // For a few seconds the top strip is free and the UI names the site and the way out.
+    const notice = ui.getByRole('status').filter({ hasText: 'is full screen' });
+    await expect(notice).toContainText(
+      `${home.slice(0, -1)} is full screen — press Esc or F11 to exit`,
+    );
+    const inNotice = await windowState(app, home);
+    expect(inNotice.view).toEqual({
+      x: 0,
+      y: 40,
+      width: inNotice.content.width,
+      height: inNotice.content.height - 40,
+    });
+    await expect(notice).toHaveCount(0, { timeout: 8000 });
+    await expect
+      .poll(async () => (await windowState(app, home)).view)
+      .toEqual({ x: 0, y: 0, width: inNotice.content.width, height: inNotice.content.height });
+    await pressKey(app, home, 'Escape');
+    await expect.poll(async () => (await windowState(app, home)).fullScreen).toBe(false);
+    await expect.poll(async () => (await windowState(app, home)).view).toEqual(before.view);
+
+    // A new tab leaves it too.
+    await pageAt(home).getByRole('button', { name: 'Fullscreen' }).click();
+    await expect.poll(async () => (await windowState(app, home)).fullScreen).toBe(true);
+    await pressKey(app, home, 'T', ['control']);
+    await expect.poll(async () => (await windowState(app, home)).fullScreen).toBe(false);
+    await pressKey(app, 'blisz://', '1', ['control']);
+    await expect.poll(async () => (await windowState(app, home)).view).toEqual(before.view);
+    expect(await pageAt(home).evaluate('document.fullscreenElement === null')).toBe(true);
+
+    // Closing the tab leaves it too.
+    await pageAt(home).getByRole('button', { name: 'Fullscreen' }).click();
+    await expect.poll(async () => (await windowState(app, home)).fullScreen).toBe(true);
+    await pressKey(app, home, 'W', ['control']);
+    await expect.poll(async () => (await windowState(app, home)).fullScreen).toBe(false);
+    await expect(ui.getByRole('navigation', { name: 'Tabs' })).toBeVisible();
+
+    // F11 toggles the window itself.
+    await pressKey(app, 'blisz://', 'F11');
+    await expect.poll(async () => (await windowState(app, home)).fullScreen).toBe(true);
+    await pressKey(app, 'blisz://', 'F11');
+    await expect.poll(async () => (await windowState(app, home)).fullScreen).toBe(false);
+    await expect(ui.getByRole('navigation', { name: 'Tabs' })).toBeVisible();
   } finally {
     await close();
   }

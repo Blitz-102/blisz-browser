@@ -29,6 +29,8 @@ contextBridge.exposeInMainWorld('bliss', {
     ipcRenderer.invoke('tab:navigate', id, input),
   tabGo: (id: number, action: TabAction): Promise<void> => ipcRenderer.invoke('tab:go', id, action),
   resetZoom: (id: number): Promise<void> => ipcRenderer.invoke('tab:reset-zoom', id),
+  respondToPrompt: (id: number, allow: boolean): Promise<void> =>
+    ipcRenderer.invoke('prompts:respond', id, allow),
   findQuery: (id: number, text: string, options: FindOptions): Promise<void> =>
     ipcRenderer.invoke('find:query', id, text, options),
   findStop: (id: number, focusPage: boolean): Promise<void> =>

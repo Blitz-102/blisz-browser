@@ -5,6 +5,7 @@ import type { TabsState } from '../shared/tabs';
 import { applyTabsUpdate } from '../shared/tabsUpdate';
 import styles from './App.module.css';
 import { Downloads } from './Downloads';
+import { ErrorCard } from './ErrorCard';
 import { FindStrip } from './FindStrip';
 import {
   ActivityIcon,
@@ -15,6 +16,7 @@ import {
   XIcon,
 } from './icons/icons';
 import { MemoryPanel } from './MemoryPanel';
+import { PermissionPrompt } from './PermissionPrompt';
 import { PinnedSites } from './PinnedSites';
 import { TabList } from './TabList';
 
@@ -136,6 +138,12 @@ export function App() {
 
   return (
     <div className={styles.frame}>
+      {activeTab?.fullscreenNotice && (
+        <p className={styles.fullscreenNotice} role="status">
+          <bdi className={styles.fullscreenOrigin}>{activeTab.fullscreenNotice}</bdi>
+          <span> is full screen — press Esc or F11 to exit</span>
+        </p>
+      )}
       <nav className={styles.sidebar} aria-label="Tabs">
         <div className={styles.topStrip}>
           <button
@@ -202,6 +210,15 @@ export function App() {
             <ShieldIcon />
           </button>
         </div>
+        {activeTab?.prompt && (
+          <PermissionPrompt
+            key={activeTab.prompt.id}
+            prompt={activeTab.prompt}
+            onRespond={(allow) =>
+              activeTab.prompt && window.bliss.respondToPrompt(activeTab.prompt.id, allow)
+            }
+          />
+        )}
         {activeTab && activeTab.blockedPopups > 0 && <p className={styles.note}>Popup blocked</p>}
         {activeTab && activeTab.blockedDownloads > 0 && (
           <p className={styles.note}>Download blocked</p>
@@ -239,6 +256,11 @@ export function App() {
         <main ref={pageRef} className={styles.page}>
           {memoryOpen ? (
             <MemoryPanel />
+          ) : activeTab?.error ? (
+            <ErrorCard
+              error={activeTab.error}
+              onRetry={() => window.bliss.tabGo(activeTab.id, 'reload')}
+            />
           ) : (
             isBlank && <p className={styles.placeholderTitle}>New tab</p>
           )}
