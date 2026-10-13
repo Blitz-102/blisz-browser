@@ -8,6 +8,7 @@ import {
   type WindowOpenHandlerResponse,
 } from 'electron';
 import { toNavigableUrl } from '../shared/address';
+import { BIDI_CONTROLS } from '../shared/bidi';
 import type {
   FindOptions,
   FindResult,
@@ -19,6 +20,7 @@ import type {
 } from '../shared/tabs';
 import { diffTabInfo } from '../shared/tabsUpdate';
 import { isWebUrl } from '../shared/url';
+import { popupPageMenu, popupTabMenu } from './contextMenu';
 import { fetchFavicon, webFaviconUrls } from './favicon';
 import { handleFromUi } from './ipc';
 import { matchShortcut, type ShortcutAction } from './shortcuts';
@@ -43,8 +45,6 @@ const MAX_INPUT_LENGTH = 32 * 1024;
 const MAX_RADIUS = 64;
 const FLUSH_DELAY_MS = 16;
 const MAX_LABEL_LENGTH = 40;
-// Bidi controls in a title could reorder the text around it in the memory panel.
-const BIDI_CONTROLS = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
 const ACTIONS: readonly string[] = ['back', 'forward', 'reload', 'stop'] satisfies TabAction[];
 
 const REPEATABLE_ACTIONS = new Set<ShortcutAction>([
@@ -62,6 +62,13 @@ const REPEATABLE_ACTIONS = new Set<ShortcutAction>([
 const POPUP_LIMIT = 2;
 const POPUP_WINDOW_MS = 5000;
 const POPUP_DISPOSITIONS = new Set<string>(['foreground-tab', 'background-tab', 'new-window']);
+// Downloads: a recent real click or key in the active tab, at most DOWNLOAD_LIMIT per
+// DOWNLOAD_WINDOW_MS. Two explicit requests get a one-shot allowance instead: "Save image" for
+// that image URL, and a tab just opened from a click or the menu for its first download.
+const DOWNLOAD_INPUT_MS = 5000;
+const DOWNLOAD_LIMIT = 3;
+const DOWNLOAD_WINDOW_MS = 10_000;
+const SAVE_AS_ALLOWANCE_MS = 5000;
 const MAX_FIND_LENGTH = 1000;
 // Chrome's zoom steps. Same-origin tabs share one zoom (Chromium's default policy).
 const ZOOM_STEPS = [
@@ -80,6 +87,12 @@ interface Tab {
   recentPopups: number[]; // times this tab opened popups, newest last
   blockedPopups: number; // reset on main-frame navigation
   lastInputAt: number; // time of the last real click or key in the page; a popup needs a recent one
+  recentDownloads: number[]; // times downloads were allowed from this tab, newest last
+  blockedDownloads: number; // reset on main-frame navigation
+  saveRequest: { url: string; until: number; kind: 'save-image' | 'save-link' } | null; // what the menu just asked for
+  openedAt: number; // when the user opened this tab; until its first navigation commits it may start one download
+  isPopup: boolean; // created by window.open or target=_blank
+  committed: boolean; // a main-frame navigation has committed; a popup that never did is download-only
 }
 
 // The page area as distances from the window edges, so a window resize can be applied at once.
@@ -112,6 +125,52 @@ export function isPageContents(contents: WebContents): boolean {
   return pageContents.has(contents);
 }
 
+// Decides whether a download that started in `contents` may proceed: 'save-image' or 'save-link'
+// when the context menu just asked for this URL, 'gesture' when a real click or key started it, null when blocked
+// (the tab then shows a note). `refuse` lets the caller veto it, for example when too many are running.
+export function gateDownload(
+  contents: WebContents,
+  url: string,
+  refuse: boolean,
+): 'gesture' | 'save-image' | 'save-link' | null {
+  const tab = tabs.find((other) => other.view?.webContents === contents);
+  if (!tab) return null;
+  const now = Date.now();
+  if (tab.saveRequest && now >= tab.saveRequest.until) tab.saveRequest = null;
+  if (!refuse && tab.saveRequest?.url === url) {
+    const { kind } = tab.saveRequest;
+    tab.saveRequest = null;
+    return kind;
+  }
+  // A tab the user just opened may be a direct link to a file; that's its one download.
+  const firstDownload = !tab.committed && now - tab.openedAt < DOWNLOAD_INPUT_MS;
+  tab.openedAt = 0;
+  if (!refuse && firstDownload) return 'gesture';
+  tab.recentDownloads = tab.recentDownloads.filter((time) => now - time < DOWNLOAD_WINDOW_MS);
+  const allowed =
+    !refuse &&
+    tab.id === activeId &&
+    now - tab.lastInputAt < DOWNLOAD_INPUT_MS &&
+    tab.recentDownloads.length < DOWNLOAD_LIMIT;
+  if (!allowed) {
+    tab.blockedDownloads++;
+    queueUpdate(tab.id);
+    return null;
+  }
+  tab.recentDownloads.push(now);
+  tab.lastInputAt = 0; // one gesture starts one download
+  return 'gesture';
+}
+
+// Like other browsers, a popup that was opened only to start a download closes itself.
+export function closeDownloadOnlyPopup(contents: WebContents): void {
+  const tab = tabs.find((other) => other.view?.webContents === contents);
+  if (!tab?.isPopup || tab.committed) return;
+  setImmediate(() => {
+    if (tabs.includes(tab)) closeTab(tab);
+  });
+}
+
 function createView(): WebContentsView {
   return new WebContentsView({
     webPreferences: { partition: PAGE_PARTITION, ...PAGE_WEB_PREFERENCES },
@@ -132,7 +191,43 @@ function attachPage(tab: Tab, view: WebContentsView): void {
   contents.on('devtools-open-url', (_event, url) => {
     if (isWebUrl(url)) navigate(createTab(), url);
   });
+  contents.on('context-menu', (_event, params) =>
+    popupPageMenu(window, contents, params, {
+      openTab: (url, options) => openInNewTab(tab, url, options),
+      saveImage: (url) => saveAs(tab, url, 'save-image'),
+      saveLink: (url) => saveAs(tab, url, 'save-link'),
+    }),
+  );
   watchPageEvents(tab, contents);
+}
+
+// The index right after `tab` and the popups it opened, so they keep their order.
+function indexAfter(tab: Tab): number {
+  const isDescendant = (other: Tab) => {
+    for (let ancestor = other.opener; ancestor; ancestor = ancestor.opener) {
+      if (ancestor === tab) return true;
+    }
+    return false;
+  };
+  let index = tabs.indexOf(tab) + 1;
+  while (tabs[index] && isDescendant(tabs[index] as Tab)) index++;
+  return index;
+}
+
+// Menu items open web URLs in a new tab next to `opener`. navigate() checks the scheme again.
+function openInNewTab(opener: Tab, url: string, { background }: { background: boolean }): void {
+  if (!isWebUrl(url) || !tabs.includes(opener)) return;
+  const tab = addTab(indexAfter(opener));
+  tab.opener = opener;
+  tab.openedAt = Date.now();
+  if (!background) activateTab(tab);
+  navigate(tab, url);
+}
+
+function saveAs(tab: Tab, url: string, kind: 'save-image' | 'save-link'): void {
+  if (!isWebUrl(url) || !tab.view) return;
+  tab.saveRequest = { url: new URL(url).href, until: Date.now() + SAVE_AS_ALLOWANCE_MS, kind };
+  tab.view.webContents.downloadURL(url);
 }
 
 // Popups open as tabs. Blocked ones are counted so the UI can say so.
@@ -167,17 +262,10 @@ function handleWindowOpen(
       const { webContents } = options as { webContents?: WebContents };
       const view = webContents ? new WebContentsView({ webContents }) : createView();
       if (!webContents) view.webContents.loadURL(url).catch(() => {});
-      // Right after the opener, and after its earlier popups so they keep their order.
-      const isDescendant = (other: Tab) => {
-        for (let ancestor = other.opener; ancestor; ancestor = ancestor.opener) {
-          if (ancestor === tab) return true;
-        }
-        return false;
-      };
-      let index = tabs.indexOf(tab) + 1;
-      while (tabs[index] && isDescendant(tabs[index] as Tab)) index++;
-      const popup = addTab(index);
+      const popup = addTab(indexAfter(tab));
       popup.opener = tab;
+      popup.openedAt = Date.now();
+      popup.isPopup = true;
       attachPage(popup, view);
       if (disposition !== 'background-tab') activateTab(popup);
       return view.webContents;
@@ -196,6 +284,7 @@ function readInfo(tab: Tab): TabInfo {
       canGoForward: false,
       favicon: null,
       blockedPopups: 0,
+      blockedDownloads: 0,
       zoom: 1,
     };
   }
@@ -209,6 +298,7 @@ function readInfo(tab: Tab): TabInfo {
     canGoForward: contents.navigationHistory.canGoForward(),
     favicon: tab.favicon,
     blockedPopups: tab.blockedPopups,
+    blockedDownloads: tab.blockedDownloads,
     zoom: Math.round(contents.getZoomFactor() * 100) / 100,
   };
 }
@@ -318,6 +408,10 @@ function watchPageEvents(tab: Tab, contents: WebContents): void {
   contents.on('did-navigate', () => {
     resetFavicon(tab);
     tab.blockedPopups = 0;
+    tab.blockedDownloads = 0;
+    tab.committed = true;
+    tab.lastInputAt = 0; // a click on the old page doesn't count for the new one
+    tab.recentDownloads = [];
     if (tab.id === activeId) closeFind();
     onChange();
   });
@@ -406,6 +500,12 @@ function addTab(index: number): Tab {
     recentPopups: [],
     blockedPopups: 0,
     lastInputAt: 0,
+    recentDownloads: [],
+    blockedDownloads: 0,
+    saveRequest: null,
+    openedAt: 0,
+    isPopup: false,
+    committed: false,
   };
   tabs.splice(index, 0, tab);
   queueUpdate(tab.id); // sends the new tab's full info
@@ -660,18 +760,13 @@ function isPageArea(value: unknown): value is PageArea {
 
 // Creates the first (blank) tab and registers the tab IPC for the given window. Single window
 // only: module state is shared and the IPC handlers are registered once.
-export function initTabs(appWindow: BaseWindow, uiContents: WebContents): void {
+export function initTabs(appWindow: BaseWindow, uiContents: WebContents): Electron.Session {
   window = appWindow;
   ui = uiContents;
   createTab();
 
   const pageSession = session.fromPartition(PAGE_PARTITION);
   pageSession.setUserAgent(toPageUserAgent(pageSession.getUserAgent()));
-  // Downloads arrive in a later step; until then cancel them so pages can't open Save As dialogs.
-  pageSession.on('will-download', (event) => {
-    event.preventDefault();
-    if (!app.isPackaged) console.warn('Download cancelled');
-  });
 
   handleFromUi('tabs:get-state', () => getState());
   handleFromUi('tab:navigate', (_event, id, input) => {
@@ -694,6 +789,18 @@ export function initTabs(appWindow: BaseWindow, uiContents: WebContents): void {
     if (tab) activateTab(tab);
   });
   handleFromUi('tabs:duplicate', (_event, id) => duplicateTab(getTab(id)).id);
+  handleFromUi('tabs:context-menu', (_event, id) => {
+    const tab = getTab(id);
+    // The tab may be gone by the time an item is picked.
+    popupTabMenu(window, {
+      duplicate: () => {
+        if (tabs.includes(tab)) duplicateTab(tab);
+      },
+      close: () => {
+        if (tabs.includes(tab)) closeTab(tab);
+      },
+    });
+  });
   handleFromUi('tab:reset-zoom', (_event, id) => {
     getTab(id).view?.webContents.setZoomFactor(1);
     queueZoomUpdates();
@@ -743,4 +850,5 @@ export function initTabs(appWindow: BaseWindow, uiContents: WebContents): void {
       if (tab.view && !tab.view.webContents.isDestroyed()) tab.view.webContents.close();
     }
   });
+  return pageSession;
 }

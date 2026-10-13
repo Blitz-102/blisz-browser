@@ -1,4 +1,5 @@
 import { contextBridge, type IpcRendererEvent, ipcRenderer } from 'electron';
+import type { DownloadInfo } from '../shared/downloads';
 import type { MetricsResult } from '../shared/metrics';
 import type {
   FindOptions,
@@ -19,6 +20,11 @@ contextBridge.exposeInMainWorld('bliss', {
   closeTab: (id: number): Promise<void> => ipcRenderer.invoke('tabs:close', id),
   activateTab: (id: number): Promise<void> => ipcRenderer.invoke('tabs:activate', id),
   duplicateTab: (id: number): Promise<number> => ipcRenderer.invoke('tabs:duplicate', id),
+  tabContextMenu: (id: number): Promise<void> => ipcRenderer.invoke('tabs:context-menu', id),
+  openDownload: (id: number): Promise<void> => ipcRenderer.invoke('downloads:open', id),
+  showDownload: (id: number): Promise<void> => ipcRenderer.invoke('downloads:show', id),
+  cancelDownload: (id: number): Promise<void> => ipcRenderer.invoke('downloads:cancel', id),
+  clearDownloads: (): Promise<void> => ipcRenderer.invoke('downloads:clear'),
   navigateTab: (id: number, input: string): Promise<boolean> =>
     ipcRenderer.invoke('tab:navigate', id, input),
   tabGo: (id: number, action: TabAction): Promise<void> => ipcRenderer.invoke('tab:go', id, action),
@@ -33,6 +39,11 @@ contextBridge.exposeInMainWorld('bliss', {
     const listener = (_event: IpcRendererEvent, update: TabsUpdate) => callback(update);
     ipcRenderer.on('tabs:update', listener);
     return () => ipcRenderer.removeListener('tabs:update', listener);
+  },
+  onDownloadsUpdate: (callback: (downloads: DownloadInfo[]) => void): (() => void) => {
+    const listener = (_event: IpcRendererEvent, downloads: DownloadInfo[]) => callback(downloads);
+    ipcRenderer.on('downloads:update', listener);
+    return () => ipcRenderer.removeListener('downloads:update', listener);
   },
   // Main asks the UI to focus the address field (Ctrl+L, Alt+D, F6). Returns an unsubscribe function.
   onFocusAddress: (callback: () => void): (() => void) => {

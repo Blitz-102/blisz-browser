@@ -54,6 +54,9 @@
   --spinner-width: 2px;
   --spinner-duration: 800ms;
 
+  /* Download progress */
+  --progress-height: 4px;
+
   /* Sleeping tabs */
   --sleeping-opacity: 0.55;
 

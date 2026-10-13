@@ -7,6 +7,7 @@ export interface TabInfo {
   canGoForward: boolean;
   favicon: string | null; // a data: URL built by main, never a remote URL
   blockedPopups: number; // popups denied since the last main-frame navigation
+  blockedDownloads: number; // downloads denied since the last main-frame navigation
   zoom: number; // zoom factor, 1 = 100%
 }
 

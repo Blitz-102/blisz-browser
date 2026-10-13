@@ -2,6 +2,49 @@
 
 Newest at the top. Each entry: what was chosen, what else was considered, why, and when to revisit.
 
+## 2026-10-13: Downloads ask where to save, gesture-gated, with an allow-list for Open
+- Chosen:
+  - **Saving:** every download on `persist:main` opens the Windows "Save as" dialog (user decision, 2026-10-13). The suggested name is sanitized:
+    - basename only;
+    - no Windows-invalid characters, leading or trailing dots, bidi/Cf/C1 characters, whitespace runs or reserved device names;
+    - length capped.
+  - **Menu items:** "Save image as…" and "Save link as…" (links, http(s) only).
+  - **Tests:** an unpackaged-only `BLISZ_DOWNLOAD_NO_PROMPT` switch saves without the dialog.
+  - **Gate:**
+    - A download needs a fresh real gesture in the active tab. The gesture is used up, and it resets on navigation.
+    - Exception: a tab the user just opened (a `target=_blank` link or "Open link in new tab") that hasn't committed a navigation gets one download within 5 s. Popups never get a made-up gesture, so they can't chain further popups.
+    - A popup tab that only downloaded closes itself afterwards.
+    - Foreign-origin subframes can't download.
+    - At most 3 per 10 s per tab and 5 running at once. Blocked downloads show a "Download blocked" note.
+    - "Save image" is allowed only for the chosen image URL and an `image/*` response.
+  - **Open:**
+    - Offered only for an allow-list of passive types: documents, images, audio, video and archives. Everything else gets "Show in folder" only.
+    - Offered only when the Mark of the Web is confirmed. Chromium writes it; our fallback writes it if it's missing, and failing to write it removes Open.
+  - **Paths:** `shell.openPath` and `showItemInFolder` only ever receive main's own recorded path, through id-only IPC.
+  - **Other sessions:** the default (UI) session cancels every download.
+  - **History:** the list is in memory only; Phase 3 adds history.
+- Alternatives considered:
+  - auto-saving into Downloads (the first version; the user prefers choosing);
+  - a deny-list of executable types (incomplete: `.url`, `.library-ms`, `.msix`, `.iso`, `.chm` and others);
+  - Chrome's looser gesture rules.
+- Why: auto-save with no Safe Browsing would otherwise let pages drop files into Downloads. Listing the safe types can't miss a new dangerous one.
+- Trade-off: "your download starts in 5 s" pages (SourceForge style) are blocked; use their direct link.
+- Revisit if:
+  - the user wants Open for more types;
+  - Phase 3 adds download history;
+  - a resume UI is wanted (interrupted downloads are cancelled now).
+- Status: settled
+
+## 2026-10-13: Native context menus
+- Chosen: native `Menu.popup` menus built from a pure, unit-tested template.
+  - **Page menu:** link, image, selection, editing (with spelling suggestions) and navigation groups, plus Inspect.
+  - **Tab row menu:** Duplicate and Close.
+  - **Safety:** clipboard writes happen in main. Untrusted label text is stripped of bidi characters, `&`-escaped and truncated. Nothing goes through `shell.openExternal`.
+- Alternatives considered: custom HTML menus (they'd need the overlay view, Phase 7).
+- Why: native menus float over page views for free, and they're accessible.
+- Revisit if: the Phase 7 overlay makes styled menus cheap.
+- Status: settled
+
 ## 2026-10-12: Smoke tests use a temporary profile
 - Chosen: when unpackaged, `BLISZ_USER_DATA` sets `userData`. Every smoke launch gets a fresh temp folder, which is deleted afterwards.
 - Alternatives considered: running against the real profile (what happened until step 2d).

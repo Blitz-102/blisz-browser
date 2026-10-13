@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
 import { toNavigableUrl } from '../shared/address';
+import type { DownloadInfo } from '../shared/downloads';
 import type { TabsState } from '../shared/tabs';
 import { applyTabsUpdate } from '../shared/tabsUpdate';
 import styles from './App.module.css';
+import { Downloads } from './Downloads';
 import { FindStrip } from './FindStrip';
 import {
   ActivityIcon,
@@ -20,6 +22,7 @@ export function App() {
   const [memoryOpen, setMemoryOpen] = useState(false);
   // The tab state comes from main, which owns the tabs.
   const [tabsState, setTabsState] = useState<TabsState | null>(null);
+  const [downloads, setDownloads] = useState<DownloadInfo[]>([]);
   const activeTab = tabsState?.tabs.find((tab) => tab.id === tabsState.activeId);
   const isBlank = activeTab?.url === '';
   // Text the user is typing in the address field; null shows the tab's URL.
@@ -37,6 +40,8 @@ export function App() {
       setTabsState((state) => state && applyTabsUpdate(state, update)),
     );
   }, []);
+
+  useEffect(() => window.bliss.onDownloadsUpdate(setDownloads), []);
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: the URL and loading state are the triggers
   useEffect(() => setSubmitted(null), [activeTab?.url, activeTab?.isLoading]);
@@ -198,6 +203,9 @@ export function App() {
           </button>
         </div>
         {activeTab && activeTab.blockedPopups > 0 && <p className={styles.note}>Popup blocked</p>}
+        {activeTab && activeTab.blockedDownloads > 0 && (
+          <p className={styles.note}>Download blocked</p>
+        )}
         <PinnedSites />
         <TabList
           tabs={tabsState?.tabs ?? []}
@@ -205,6 +213,14 @@ export function App() {
           onSelect={selectTab}
           onClose={(id) => window.bliss.closeTab(id)}
           onNewTab={addTab}
+          onContextMenu={(id) => window.bliss.tabContextMenu(id)}
+        />
+        <Downloads
+          downloads={downloads}
+          onOpen={(id) => window.bliss.openDownload(id)}
+          onShow={(id) => window.bliss.showDownload(id)}
+          onCancel={(id) => window.bliss.cancelDownload(id)}
+          onClear={() => window.bliss.clearDownloads()}
         />
         <button
           type="button"

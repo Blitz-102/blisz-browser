@@ -1,3 +1,4 @@
+import { mkdirSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
@@ -12,6 +13,7 @@ import {
 } from 'electron';
 import { isWebUrl } from '../shared/url';
 import { runBench } from './bench';
+import { initDownloads } from './downloads';
 import { addTrustedUi, handleFromUi, UI_URL } from './ipc';
 import { getMetrics } from './metrics';
 import { getTabProcessLabels, handleShortcuts, initTabs, isPageContents } from './tabs';
@@ -29,7 +31,14 @@ const READ_COLORS_TIMEOUT_MS = 2000;
 // Smoke tests use a throwaway profile so they never touch the real one. Ignored when packaged.
 if (!app.isPackaged && process.env.BLISZ_USER_DATA) {
   app.setPath('userData', process.env.BLISZ_USER_DATA);
+  // Test downloads land in the throwaway profile, not the real Downloads folder.
+  const downloads = join(process.env.BLISZ_USER_DATA, 'Downloads');
+  mkdirSync(downloads, { recursive: true });
+  app.setPath('downloads', downloads);
 }
+// Test-only: smoke tests can't drive the native "Save as" dialog, so they ask for downloads to
+// be saved straight into the Downloads folder. Ignored when packaged.
+const saveDownloadsWithoutPrompt = !app.isPackaged && process.env.BLISZ_DOWNLOAD_NO_PROMPT === '1';
 
 // A debugging port lets malware (infostealers) read cookies and drive the UI over CDP. Unpackaged
 // builds keep it because Playwright needs it.
@@ -165,7 +174,8 @@ function createWindow(): WebContents {
   });
   addTrustedUi(uiView.webContents);
   window.contentView.addChildView(uiView);
-  initTabs(window, uiView.webContents);
+  const pageSession = initTabs(window, uiView.webContents);
+  initDownloads(uiView.webContents, pageSession, saveDownloadsWithoutPrompt);
   handleShortcuts(uiView.webContents);
 
   // getContentBounds() is in screen coordinates; the view needs window-relative ones.
@@ -223,6 +233,8 @@ function createWindow(): WebContents {
 
 app.whenReady().then(() => {
   session.defaultSession.protocol.handle('blisz', serveUiFiles);
+  // The UI view never downloads; page views use their own session (see downloads.ts).
+  session.defaultSession.on('will-download', (event) => event.preventDefault());
   handleFromUi('app:get-version', () => app.getVersion());
   const ui = createWindow();
   handleFromUi('metrics:get', () => getMetrics(ui.getOSProcessId(), getTabProcessLabels()));

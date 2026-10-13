@@ -9,6 +9,11 @@ interface Window {
     closeTab(id: number): Promise<void>;
     activateTab(id: number): Promise<void>;
     duplicateTab(id: number): Promise<number>;
+    tabContextMenu(id: number): Promise<void>;
+    openDownload(id: number): Promise<void>;
+    showDownload(id: number): Promise<void>;
+    cancelDownload(id: number): Promise<void>;
+    clearDownloads(): Promise<void>;
     navigateTab(id: number, input: string): Promise<boolean>;
     tabGo(id: number, action: import('../shared/tabs').TabAction): Promise<void>;
     resetZoom(id: number): Promise<void>;
@@ -20,6 +25,9 @@ interface Window {
     findStop(id: number, focusPage: boolean): Promise<void>;
     setPageArea(area: import('../shared/tabs').PageArea): Promise<void>;
     onTabsUpdate(callback: (update: import('../shared/tabs').TabsUpdate) => void): () => void;
+    onDownloadsUpdate(
+      callback: (downloads: import('../shared/downloads').DownloadInfo[]) => void,
+    ): () => void;
     onFocusAddress(callback: () => void): () => void;
     onOpenFind(callback: () => void): () => void;
     onCloseFind(callback: () => void): () => void;

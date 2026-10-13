@@ -1,5 +1,5 @@
-import { mkdtempSync, rmSync } from 'node:fs';
-import { createServer } from 'node:http';
+import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { createServer, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -19,7 +19,12 @@ async function launch(): Promise<ElectronApplication> {
     // Scale factor 1 so 1280x800 is exact; at 125% display scaling Windows rounds the height to 801.
     args: ['.', '--force-device-scale-factor=1'],
     // Blank forces the built blisz:// UI instead of a dev server URL from the environment.
-    env: { ...process.env, ELECTRON_RENDERER_URL: '', BLISZ_USER_DATA: userData },
+    env: {
+      ...process.env,
+      ELECTRON_RENDERER_URL: '',
+      BLISZ_USER_DATA: userData,
+      BLISZ_DOWNLOAD_NO_PROMPT: '1', // the native Save as dialog can't be driven by a test
+    },
   });
   app.on('close', () => rmSync(userData, { recursive: true, force: true, maxRetries: 5 }));
   return app;
@@ -436,6 +441,11 @@ const FIXTURE_PAGES: Record<string, string> = {
     <button onclick="window.open('/popup'); window.open('/popup')">Open two</button>`,
   '/popup': `<title>Fixture popup</title><script>document.title = window.opener !== null ? 'opener:yes' : 'opener:no'</script>`,
   '/closer': '<title>Fixture closer</title><script>setTimeout(() => window.close(), 1000)</script>',
+  '/scripted': `<title>Fixture scripted</title><button id="go">Go</button>
+    <script>document.getElementById('go').onclick = () => {
+      const popup = window.open('about:blank');
+      popup.eval("setTimeout(() => window.open('/popup'), 100)");
+    }</script>`,
   '/spam': `<title>Fixture spam</title>
     <script>setTimeout(() => { for (let i = 0; i < 5; i++) window.open('/popup') }, 100)</script>`,
   '/links':
@@ -760,5 +770,436 @@ test('zoom: shortcuts, steps, shared by origin, reset button and Ctrl+scroll', a
   } finally {
     await app.close();
     fixture.stop();
+  }
+});
+
+// A fixture site with downloads. Every file sends half of its bytes and then waits for release(),
+// so tests can look at (or cancel) a download that is really running. /broken.zip drops the connection.
+const FILE_SIZE = 2000;
+
+async function startDownloadFixture(): Promise<{
+  home: string;
+  release: () => void;
+  stop: () => void;
+}> {
+  const held: ServerResponse[] = [];
+  const server = createServer((request, response) => {
+    const path = (request.url ?? '/').split('?')[0] ?? '/';
+    if (path === '/report.zip' || path === '/setup.exe' || path === '/broken.zip') {
+      response.writeHead(200, {
+        'Content-Type': 'application/octet-stream',
+        'Content-Disposition': `attachment; filename="${path.slice(1)}"`,
+        'Content-Length': FILE_SIZE,
+      });
+      response.write(Buffer.alloc(FILE_SIZE / 2));
+      if (path === '/broken.zip') setTimeout(() => request.socket.destroy(), 300);
+      else held.push(response);
+    } else if (path === '/slow.png') {
+      response.setHeader('Content-Type', 'image/png');
+      response.write(FAVICON_PNG.subarray(0, 20));
+      held.push(response);
+    } else if (path === '/pic.png') {
+      response.setHeader('Content-Type', 'image/png');
+      response.end(FAVICON_PNG);
+    } else {
+      response.setHeader('Content-Type', 'text/html');
+      const pages: Record<string, string> = {
+        '/auto': `<title>Fixture auto</title><a id="dl" href="/report.zip">Report</a>
+          <script>setTimeout(() => document.getElementById('dl').click(), 100)</script>`,
+        '/after': `<title>Fixture after</title><a id="dl" href="/report.zip">Report</a>
+          <script>setTimeout(() => document.getElementById('dl').click(), 500)</script>`,
+      };
+      response.end(
+        pages[path] ??
+          `<title>Fixture downloads</title><a href="/report.zip">Report</a>
+          <a href="/setup.exe">Setup</a> <a href="/broken.zip">Broken</a>
+          <a href="/report.zip" target="_blank">Report in new tab</a> <a href="/after">Later</a>
+          <img src="/pic.png" alt="Picture">`,
+      );
+    }
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const release = () => {
+    for (const response of held.splice(0)) {
+      response.end(
+        response.getHeader('Content-Type') === 'image/png'
+          ? FAVICON_PNG.subarray(20)
+          : Buffer.alloc(FILE_SIZE / 2),
+      );
+    }
+  };
+  return {
+    home: `http://127.0.0.1:${(server.address() as AddressInfo).port}/`,
+    release,
+    stop: () => {
+      server.closeAllConnections();
+      server.close();
+    },
+  };
+}
+
+async function openDownloadSession() {
+  const fixture = await startDownloadFixture();
+  const app = await launch().catch((error) => {
+    fixture.stop();
+    throw error;
+  });
+  const close = async () => {
+    await app.close();
+    fixture.stop();
+  };
+  try {
+    const ui = await findUi(app);
+    const address = ui.getByRole('textbox', { name: 'Address' });
+    const downloadsDir = await app.evaluate(({ app }) => app.getPath('downloads'));
+    const pageAt = (url: string) => {
+      const view = app.windows().find((window) => window.url() === url);
+      if (!view) throw new Error(`Page view not found at ${url}`);
+      return view;
+    };
+    await address.fill(fixture.home);
+    await address.press('Enter');
+    await expect(ui.locator('[aria-current="page"]')).toContainText('Fixture downloads');
+    return {
+      app,
+      ui,
+      address,
+      home: fixture.home,
+      release: fixture.release,
+      downloadsDir,
+      pageAt,
+      close,
+    };
+  } catch (error) {
+    await close();
+    throw error;
+  }
+}
+
+test('a clicked download saves into Downloads, shows progress, and Open and Show use main path', async () => {
+  const { app, ui, home, release, downloadsDir, pageAt, close } = await openDownloadSession();
+  try {
+    // Record the shell calls instead of opening real windows.
+    await app.evaluate(({ shell }) => {
+      const calls: string[][] = [];
+      (globalThis as unknown as { shellCalls: string[][] }).shellCalls = calls;
+      shell.openPath = async (path) => {
+        calls.push(['open', path]);
+        return '';
+      };
+      shell.showItemInFolder = (path) => {
+        calls.push(['show', path]);
+      };
+    });
+    const shellCalls = () =>
+      app.evaluate(() => (globalThis as unknown as { shellCalls: string[][] }).shellCalls);
+    const section = ui.getByRole('region', { name: 'Downloads' });
+    await expect(section).toHaveCount(0);
+
+    await pageAt(home).getByRole('link', { name: 'Report', exact: true }).click();
+    const item = section.getByRole('listitem').first();
+    await expect(item).toContainText('report.zip');
+    await expect(item.getByRole('button', { name: 'Cancel' })).toBeVisible();
+    await expect(item.getByRole('button', { name: 'Open' })).toHaveCount(0);
+    await expect(item.getByRole('progressbar')).toHaveJSProperty('value', 50);
+    release();
+    await expect(item.getByRole('progressbar')).toHaveJSProperty('value', 100);
+    await expect(item).toContainText('Done');
+    const file = join(downloadsDir, 'report.zip');
+    expect(statSync(file).size).toBe(FILE_SIZE);
+
+    // The file is marked as downloaded from the internet. Chromium writes the stream itself (a
+    // scratch run showed it does, adding ReferrerUrl when there is a referrer); our fallback in
+    // downloads.ts only runs if it ever stops. The content is logged so a change is noticed.
+    if (process.platform === 'win32') {
+      const mark = readFileSync(`${file}:Zone.Identifier`, 'utf8');
+      console.log(`Mark of the Web on a fixture download: ${JSON.stringify(mark)}`);
+      expect(mark).toMatch(/^\[ZoneTransfer\]\r\nZoneId=3\r\n/);
+      expect(mark).toContain(`HostUrl=${home}report.zip`);
+    }
+
+    await item.getByRole('button', { name: 'Show report.zip in folder' }).click();
+    await item.getByRole('button', { name: 'Open report.zip' }).click();
+    await expect.poll(shellCalls).toEqual([
+      ['show', file],
+      ['open', file],
+    ]);
+
+    // The same name again gets a number. Executables can't be opened from the list.
+    await pageAt(home).getByRole('link', { name: 'Report', exact: true }).click();
+    await expect(
+      section
+        .getByRole('listitem')
+        .nth(1)
+        .getByRole('button', { name: /^Cancel/ }),
+    ).toBeVisible();
+    release();
+    await expect(section.getByRole('listitem').nth(1)).toContainText('Done');
+    expect(readdirSync(downloadsDir).sort()).toEqual(['report (1).zip', 'report.zip']);
+    await pageAt(home).getByRole('link', { name: 'Setup' }).click();
+    const setup = section.getByRole('listitem').nth(2);
+    await expect(setup.getByRole('button', { name: /^Cancel/ })).toBeVisible();
+    release();
+    await expect(setup).toContainText('Done');
+    await expect(setup.getByRole('button', { name: 'Open' })).toHaveCount(0);
+    await expect(setup.getByRole('button', { name: 'Show setup.exe in folder' })).toBeVisible();
+
+    await section.getByRole('button', { name: 'Clear' }).click();
+    await expect(section).toHaveCount(0);
+  } finally {
+    await close();
+  }
+});
+
+test('a running download can be cancelled', async () => {
+  const { ui, home, downloadsDir, pageAt, close } = await openDownloadSession();
+  try {
+    await pageAt(home).getByRole('link', { name: 'Report', exact: true }).click();
+    const item = ui.getByRole('region', { name: 'Downloads' }).getByRole('listitem').first();
+    await item.getByRole('button', { name: 'Cancel' }).click();
+    await expect(item).toContainText('Cancelled');
+    await expect(item.getByRole('button', { name: 'Open' })).toHaveCount(0);
+    // Chromium removes the partial file shortly after the cancel.
+    await expect.poll(() => readdirSync(downloadsDir)).toEqual([]);
+  } finally {
+    await close();
+  }
+});
+
+test('a download without a click or key is blocked and noted', async () => {
+  const { ui, address, home, downloadsDir, close } = await openDownloadSession();
+  try {
+    await address.fill(`${home}auto`);
+    await address.press('Enter');
+    await expect(ui.getByText('Download blocked')).toBeVisible();
+    await expect(ui.getByRole('region', { name: 'Downloads' })).toHaveCount(0);
+    await ui.waitForTimeout(500);
+    expect(readdirSync(downloadsDir)).toEqual([]);
+
+    // Navigating resets the note.
+    await address.fill(home);
+    await address.press('Enter');
+    await expect(ui.getByText('Download blocked')).toHaveCount(0);
+  } finally {
+    await close();
+  }
+});
+
+// Pops the page context menu for `params` without a real right-click, choosing the item `label`.
+function pickPageMenuItem(
+  app: ElectronApplication,
+  url: string,
+  params: Record<string, unknown>,
+  label: string,
+) {
+  return app.evaluate(
+    ({ Menu, webContents }, { url, params, label }) => {
+      const contents = webContents.getAllWebContents().find((c) => c.getURL() === url);
+      Menu.prototype.popup = function () {
+        this.items.find((entry) => entry.label === label)?.click();
+      };
+      const base = {
+        linkURL: '',
+        srcURL: '',
+        mediaType: 'none',
+        hasImageContents: false,
+        selectionText: '',
+        isEditable: false,
+        misspelledWord: '',
+        dictionarySuggestions: [],
+        editFlags: {},
+        x: 5,
+        y: 5,
+      };
+      contents?.emit('context-menu', {}, { ...base, ...params });
+    },
+    { url, params, label },
+  );
+}
+
+test('the page context menu saves and copies images and links through main', async () => {
+  const { app, ui, home, downloadsDir, close } = await openDownloadSession();
+  try {
+    const image = { mediaType: 'image', srcURL: `${home}pic.png`, hasImageContents: true };
+    // No click happened, so only the menu's own "Save image as" allowance lets this download through.
+    await pickPageMenuItem(app, home, image, 'Save image as…');
+    const item = ui.getByRole('region', { name: 'Downloads' }).getByRole('listitem').first();
+    await expect(item).toContainText('pic.png');
+    await expect(item).toContainText('Done');
+    expect(statSync(join(downloadsDir, 'pic.png')).size).toBeGreaterThan(0);
+    // The allowance is spent: a second download without input is blocked.
+    await app.evaluate(({ webContents }, url) => {
+      webContents
+        .getAllWebContents()
+        .find((c) => c.getURL() === url)
+        ?.downloadURL(`${url}pic.png`);
+    }, home);
+    await expect(ui.getByText('Download blocked')).toBeVisible();
+
+    const readClipboard = () => app.evaluate(({ clipboard }) => clipboard.readText());
+    await pickPageMenuItem(app, home, image, 'Copy image address');
+    await expect.poll(readClipboard).toBe(`${home}pic.png`);
+    await pickPageMenuItem(app, home, { linkURL: `${home}report.zip` }, 'Copy link address');
+    await expect.poll(readClipboard).toBe(`${home}report.zip`);
+
+    // A background tab opens right after the current one; the current tab stays active.
+    const tabs = ui.getByRole('list', { name: 'Open tabs' }).getByRole('listitem');
+    await expect(tabs).toHaveCount(2);
+    await pickPageMenuItem(app, home, { linkURL: `${home}auto` }, 'Open link in new tab');
+    await expect(tabs).toHaveCount(3);
+    await expect(ui.locator('[aria-current="page"]')).toContainText('Fixture downloads');
+    await expect(tabs.nth(1)).toContainText('Fixture auto');
+  } finally {
+    await close();
+  }
+});
+
+test('right-clicking a tab offers Duplicate and Close', async () => {
+  const { app, ui, close } = await openDownloadSession();
+  try {
+    const tabs = ui.getByRole('list', { name: 'Open tabs' }).getByRole('listitem');
+    const choose = async (label: string) => {
+      await app.evaluate(({ Menu }, label) => {
+        Menu.prototype.popup = function () {
+          this.items.find((entry) => entry.label === label)?.click();
+        };
+      }, label);
+      await tabs.first().click({ button: 'right' });
+    };
+    await expect(tabs).toHaveCount(2);
+    await choose('Duplicate');
+    await expect(tabs).toHaveCount(3);
+    await expect(tabs.nth(1)).toContainText('Fixture downloads');
+    await choose('Close');
+    await expect(tabs).toHaveCount(2);
+    await expect(ui.locator('[aria-current="page"]')).toContainText('Fixture downloads');
+  } finally {
+    await close();
+  }
+});
+
+test('a download that loses its connection ends as Failed and can be cleared', async () => {
+  const { ui, home, pageAt, close } = await openDownloadSession();
+  try {
+    await pageAt(home).getByRole('link', { name: 'Broken' }).click();
+    const section = ui.getByRole('region', { name: 'Downloads' });
+    const item = section.getByRole('listitem').first();
+    await expect(item).toContainText('Failed');
+    await expect(item.getByRole('button', { name: /^Cancel/ })).toHaveCount(0);
+    await expect(item.getByRole('button', { name: /^Open/ })).toHaveCount(0);
+    await expect(item.getByRole('progressbar')).toHaveCount(0);
+    await section.getByRole('button', { name: 'Clear' }).click();
+    await expect(section).toHaveCount(0);
+  } finally {
+    await close();
+  }
+});
+
+test('a target=_blank download link downloads and closes its popup tab', async () => {
+  const { ui, home, release, pageAt, close } = await openDownloadSession();
+  try {
+    const tabs = ui.getByRole('list', { name: 'Open tabs' }).getByRole('listitem');
+    await pageAt(home).getByRole('link', { name: 'Report in new tab' }).click();
+    const item = ui.getByRole('region', { name: 'Downloads' }).getByRole('listitem').first();
+    await expect(item.getByRole('button', { name: /^Cancel/ })).toBeVisible();
+    // The popup only existed to start the download, so it is gone and the opener is active again.
+    await expect(tabs).toHaveCount(2);
+    await expect(ui.locator('[aria-current="page"]')).toContainText('Fixture downloads');
+    release();
+    await expect(item).toContainText('Done');
+  } finally {
+    await close();
+  }
+});
+
+test('a click on the previous page does not let the next page download', async () => {
+  const { ui, home, downloadsDir, pageAt, close } = await openDownloadSession();
+  try {
+    // The click navigates to /after, whose script clicks a download link 500 ms later.
+    await pageAt(home).getByRole('link', { name: 'Later' }).click();
+    await expect(ui.getByText('Download blocked')).toBeVisible();
+    await expect(ui.getByRole('region', { name: 'Downloads' })).toHaveCount(0);
+    expect(readdirSync(downloadsDir)).toEqual([]);
+  } finally {
+    await close();
+  }
+});
+
+test('at most five downloads run at once', async () => {
+  const { app, ui, home, release, close } = await openDownloadSession();
+  try {
+    const items = ui.getByRole('region', { name: 'Downloads' }).getByRole('listitem');
+    // "Save image as" skips the click rule, so five can be started without input.
+    for (const number of [1, 2, 3, 4, 5]) {
+      const image = { mediaType: 'image', srcURL: `${home}slow.png?n=${number}` };
+      await pickPageMenuItem(app, home, image, 'Save image as…');
+      await expect(items).toHaveCount(number);
+    }
+    await pickPageMenuItem(
+      app,
+      home,
+      { mediaType: 'image', srcURL: `${home}slow.png?n=6` },
+      'Save image as…',
+    );
+    await expect(ui.getByText('Download blocked')).toBeVisible();
+    await expect(items).toHaveCount(5);
+    release();
+    await expect(items.getByText('Done')).toHaveCount(5);
+  } finally {
+    await close();
+  }
+});
+
+test('a scripted about:blank popup cannot open another popup without real input', async () => {
+  const { ui, address, home, getState, pageAt, close } = await openFixtureSession();
+  try {
+    await address.fill(`${home}scripted`);
+    await address.press('Enter');
+    await expect.poll(async () => (await getState()).tabs[0]?.title).toBe('Fixture scripted');
+    await pageAt(`${home}scripted`).getByRole('button', { name: 'Go' }).click();
+    await expect.poll(async () => (await getState()).order.length).toBe(2);
+    // The popup is now the active tab; its own window.open has no click or key behind it.
+    await expect.poll(async () => (await getState()).tabs[1]?.blockedPopups).toBe(1);
+    expect((await getState()).order).toHaveLength(2);
+    expect(ui).toBeTruthy();
+  } finally {
+    await close();
+  }
+});
+
+test('"Open link in new tab" on a download link downloads and keeps the tab', async () => {
+  const { app, ui, home, release, close } = await openDownloadSession();
+  try {
+    await pickPageMenuItem(app, home, { linkURL: `${home}report.zip` }, 'Open link in new tab');
+    const item = ui.getByRole('region', { name: 'Downloads' }).getByRole('listitem').first();
+    await expect(item.getByRole('button', { name: /^Cancel/ })).toBeVisible();
+    release();
+    await expect(item).toContainText('Done');
+    // The tab was asked for by the user, so it stays (unlike a download-only popup).
+    await expect(ui.getByRole('list', { name: 'Open tabs' }).getByRole('listitem')).toHaveCount(3);
+  } finally {
+    await close();
+  }
+});
+
+test('"Save link as" downloads a linked file without a click', async () => {
+  const { app, ui, home, release, downloadsDir, close } = await openDownloadSession();
+  try {
+    await pickPageMenuItem(app, home, { linkURL: `${home}report.zip` }, 'Save link as…');
+    const item = ui.getByRole('region', { name: 'Downloads' }).getByRole('listitem').first();
+    await expect(item.getByRole('button', { name: /^Cancel/ })).toBeVisible();
+    release();
+    await expect(item).toContainText('Done');
+    expect(readdirSync(downloadsDir)).toEqual(['report.zip']);
+    // The allowance was for that one link and is spent.
+    await app.evaluate(({ webContents }, url) => {
+      webContents
+        .getAllWebContents()
+        .find((c) => c.getURL() === url)
+        ?.downloadURL(`${url}report.zip`);
+    }, home);
+    await expect(ui.getByText('Download blocked')).toBeVisible();
+  } finally {
+    await close();
   }
 });

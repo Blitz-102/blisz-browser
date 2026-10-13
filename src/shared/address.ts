@@ -1,5 +1,9 @@
 const SEARCH_URL = 'https://www.google.com/search?q=';
 
+export function searchUrl(text: string): string {
+  return SEARCH_URL + encodeURIComponent(text);
+}
+
 const IPV4 = String.raw`\d{1,3}(?:\.\d{1,3}){3}`;
 const DOMAIN = String.raw`(?:[a-z0-9-]+\.)+[a-z]{2,}`;
 // localhost, an IPv4 address or a domain, then an optional port and path.
@@ -14,10 +18,10 @@ const HAS_SCHEME = /^[a-z][a-z0-9+.-]*:/i;
 export function toNavigableUrl(input: string): string {
   const text = input.trim();
   if (text === '') return '';
-  if (/\s/.test(text)) return SEARCH_URL + encodeURIComponent(text);
+  if (/\s/.test(text)) return searchUrl(text);
   if (BARE_IPV6.test(text) && URL.canParse(`http://[${text}]`)) return `http://[${text}]`;
   if (BRACKETED_IPV6.test(text) || LOCAL_HOST_LIKE.test(text)) return `http://${text}`;
   if (HOST_LIKE.test(text)) return `https://${text}`;
   if (HAS_SCHEME.test(text)) return text;
-  return SEARCH_URL + encodeURIComponent(text);
+  return searchUrl(text);
 }

@@ -11,6 +11,7 @@ const tab: TabInfo = {
   canGoForward: false,
   favicon: null,
   blockedPopups: 0,
+  blockedDownloads: 0,
   zoom: 1,
 };
 

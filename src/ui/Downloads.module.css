@@ -1,0 +1,111 @@
+.section {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: 0 var(--space-3);
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.heading {
+  margin: 0;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-strong);
+}
+
+.list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.item {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.name {
+  min-width: 0;
+  unicode-bidi: isolate; /* file names can be right-to-left; keep them from reordering neighbours */
+  overflow: hidden;
+  font-size: var(--font-size-sm);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.progress {
+  width: 100%;
+  height: var(--progress-height);
+  border: 0;
+  border-radius: var(--radius-sm);
+  appearance: none;
+  background: var(--color-border);
+  color: var(--color-accent);
+  overflow: hidden;
+}
+
+.progress::-webkit-progress-bar {
+  background: var(--color-border);
+}
+
+.progress::-webkit-progress-value {
+  background: var(--color-accent);
+}
+
+.row {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+}
+
+.status {
+  flex: 1;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+}
+
+.action {
+  padding: 0 var(--space-1);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-accent);
+  font-size: var(--font-size-sm);
+  transition: background var(--duration-fast);
+}
+
+.action:hover {
+  background: var(--color-surface-hover);
+}
+
+.action:focus-visible {
+  outline: var(--focus-ring-width) solid var(--color-accent);
+  outline-offset: var(--focus-ring-offset);
+}
+
+/* Read by screen readers only. */
+.hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.heading:focus-visible {
+  outline: var(--focus-ring-width) solid var(--color-accent);
+  outline-offset: var(--focus-ring-offset);
+}

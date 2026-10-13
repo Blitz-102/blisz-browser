@@ -9,6 +9,7 @@ interface TabListProps {
   onSelect: (id: number) => void;
   onClose: (id: number) => void;
   onNewTab: () => void;
+  onContextMenu: (id: number) => void;
 }
 
 // Titles and URLs come from web pages; they are only ever rendered as text.
@@ -18,7 +19,14 @@ function tabLabel(tab: TabInfo): string {
   return 'New tab';
 }
 
-export function TabList({ tabs, activeId, onSelect, onClose, onNewTab }: TabListProps) {
+export function TabList({
+  tabs,
+  activeId,
+  onSelect,
+  onClose,
+  onNewTab,
+  onContextMenu,
+}: TabListProps) {
   const listRef = useRef<HTMLUListElement>(null);
   const closingId = useRef<number | null>(null);
 
@@ -36,7 +44,11 @@ export function TabList({ tabs, activeId, onSelect, onClose, onNewTab }: TabList
         const label = tabLabel(tab);
         const isActive = tab.id === activeId;
         return (
-          <li key={tab.id} className={isActive ? `${styles.row} ${styles.rowActive}` : styles.row}>
+          <li
+            key={tab.id}
+            className={isActive ? `${styles.row} ${styles.rowActive}` : styles.row}
+            onContextMenu={() => onContextMenu(tab.id)}
+          >
             <button
               type="button"
               className={styles.select}
