@@ -1,4 +1,6 @@
-import { mkdirSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { mkdirSync, mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
@@ -39,11 +41,37 @@ const TITLE_BAR_HEIGHT = 40;
 const OPAQUE_RGB = /^rgb\(\d{1,3}, \d{1,3}, \d{1,3}\)$/;
 const READ_COLORS_TIMEOUT_MS = 2000;
 
-// Smoke tests use a throwaway profile so they never touch the real one. Ignored when packaged.
-if (!app.isPackaged && process.env.BLISZ_USER_DATA) {
-  app.setPath('userData', process.env.BLISZ_USER_DATA);
+// `npm run bench:memory` passes --bench. Never honoured in a packaged app, and only read before
+// a `--` separator.
+const args = process.argv.slice(1);
+const benchMode =
+  !app.isPackaged &&
+  args.slice(0, args.includes('--') ? args.indexOf('--') : undefined).includes('--bench');
+
+// Smoke tests and the benchmark use a throwaway profile so they never touch the real one.
+// Ignored when packaged.
+let throwawayProfile = !app.isPackaged ? process.env.BLISZ_USER_DATA : undefined;
+if (benchMode && !throwawayProfile) {
+  const benchProfile = mkdtempSync(join(tmpdir(), 'blisz-bench-'));
+  throwawayProfile = benchProfile;
+  // Chromium's helper processes (and this one) still hold the profile's files while we exit, so
+  // a detached Node process deletes it once they have let go. The path is passed as an argument.
+  process.on('exit', () => {
+    spawn(
+      process.execPath,
+      [
+        '-e',
+        "require('node:fs').rmSync(process.argv[1], { recursive: true, force: true, maxRetries: 50, retryDelay: 200 })",
+        benchProfile,
+      ],
+      { detached: true, stdio: 'ignore', env: { ELECTRON_RUN_AS_NODE: '1' } },
+    ).unref();
+  });
+}
+if (throwawayProfile) {
+  app.setPath('userData', throwawayProfile);
   // Test downloads land in the throwaway profile, not the real Downloads folder.
-  const downloads = join(process.env.BLISZ_USER_DATA, 'Downloads');
+  const downloads = join(throwawayProfile, 'Downloads');
   mkdirSync(downloads, { recursive: true });
   app.setPath('downloads', downloads);
 }
@@ -265,10 +293,7 @@ app.whenReady().then(() => {
   handleFromUi('app:get-version', () => app.getVersion());
   const ui = createWindow();
   handleFromUi('metrics:get', () => getMetrics(ui.getOSProcessId(), getTabProcessLabels()));
-  // `npm run bench:memory` passes --bench; never honoured in a packaged app.
-  if (!app.isPackaged && process.argv.includes('--bench')) {
-    runBench(ui);
-  }
+  if (benchMode) runBench(ui);
 });
 
 app.on('window-all-closed', () => {

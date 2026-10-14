@@ -2,6 +2,22 @@
 
 Newest at the top. Each entry: what was chosen, what else was considered, why, and when to revisit.
 
+## 2026-10-14: Memory budget is to stay below Brave's
+- Chosen: on the `bench/sites.json` tab set, Blisz's total private working set must stay below Brave's (same method, `scripts/measure-memory.ps1` and `scripts/bench-brave.ps1`, medians of three runs). This is the user's rule.
+- First result (2026-10-14, see `docs/perf-log.md`): Blisz 1,264 MB against Brave 1,094 MB. **The budget is not met yet.**
+- Alternatives considered: a fixed MB budget (rejected: depends on the machine and the sites, while Brave is measured on the same run).
+- Why: the user's priority is lightweight, and Brave is the reference.
+- Expected levers (PLAN 5.2): sleeping tabs (Phase 3) and ad and tracker blocking (Phase 6). Phase 2 can't be closed against the budget until the gap is closed or the user accepts it.
+- Revisit if: Brave's numbers move a lot between runs, or the tab set changes.
+- Status: settled (the rule); the gap is open
+
+## 2026-10-14: Spellcheck stays on (decision #18)
+- Chosen: keep spellcheck on in page views (Electron's default, not overridden).
+- Alternatives considered: turning it off to save memory.
+- Why: the user's rule, "keep it only if Brave has it". Brave has it on: its Preferences file has no setting that turns it off, and its dictionary is en-US. Blisz's right-click suggestions depend on it. Both are on, so there's no difference to save.
+- Revisit if: a spellcheck measurement shows a large cost in Blisz that Brave doesn't have.
+- Status: settled
+
 ## 2026-10-13: Error cards, fullscreen notice, no certificate bypass
 - Chosen:
   - **Error cards:**

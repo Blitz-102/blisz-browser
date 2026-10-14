@@ -798,6 +798,20 @@ function closeTab(tab: Tab): void {
   else createTab(); // closing the last tab leaves a blank one
 }
 
+// Benchmark only (src/main/bench.ts): loads every URL as a tab, the first in the blank tab that
+// exists at launch. The last tab ends up active.
+export function openBenchTabs(urls: string[]): void {
+  for (const [index, url] of urls.entries()) {
+    const tab = index === 0 ? tabs[0] : createTab();
+    if (tab) navigate(tab, url);
+  }
+}
+
+// Benchmark only: how many tabs have a page that finished loading.
+export function countLoadedTabs(): number {
+  return tabs.filter((tab) => tab.view && !tab.view.webContents.isLoading()).length;
+}
+
 // "Tab: <title>" per page process, for the memory panel. Text only; the title is untrusted.
 export function getTabProcessLabels(): Map<number, string> {
   const titles = new Map<number, string[]>();

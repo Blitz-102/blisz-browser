@@ -1,0 +1,15 @@
+{
+  "settleSeconds": 60,
+  "sites": [
+    { "name": "MDN", "url": "https://developer.mozilla.org/en-US/docs/Web/CSS" },
+    { "name": "Wikipedia", "url": "https://en.wikipedia.org/wiki/Web_browser" },
+    { "name": "Stack Overflow", "url": "https://stackoverflow.com/questions" },
+    { "name": "GitHub", "url": "https://github.com/electron/electron" },
+    { "name": "Electron docs", "url": "https://www.electronjs.org/docs/latest" },
+    { "name": "Reddit", "url": "https://www.reddit.com/" },
+    { "name": "X", "url": "https://x.com/" },
+    { "name": "YouTube channel", "url": "https://www.youtube.com/@Fireship" },
+    { "name": "Hacker News", "url": "https://news.ycombinator.com/" },
+    { "name": "BBC News", "url": "https://www.bbc.com/news" }
+  ]
+}

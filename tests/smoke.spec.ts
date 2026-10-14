@@ -1,4 +1,13 @@
-import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { createServer, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -1508,5 +1517,55 @@ test('HTML fullscreen fills the window; Esc, a tab switch and F11 put things bac
     await expect(ui.getByRole('navigation', { name: 'Tabs' })).toBeVisible();
   } finally {
     await close();
+  }
+});
+
+test('--bench opens the configured sites, prints the totals and removes its temp profile', async () => {
+  test.setTimeout(60_000);
+  const server = createServer((_request, response) => {
+    response.setHeader('Content-Type', 'text/html');
+    response.end('<title>Fixture bench</title><p>Bench</p>');
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address() as AddressInfo;
+  // A private TEMP folder shows whether the bench's own temp profile was deleted at exit.
+  const temp = mkdtempSync(join(tmpdir(), 'blisz-bench-test-'));
+  const configPath = join(temp, 'sites.json');
+  const sites = ['a', 'b'].map((name) => ({ name, url: `http://127.0.0.1:${port}/${name}` }));
+  writeFileSync(configPath, JSON.stringify({ settleSeconds: 2, sites }));
+  const profileParent = join(temp, 'tmp');
+  mkdirSync(profileParent);
+  try {
+    // Plain spawn, not Playwright: the bench must run and exit on its own, with a visible exit code.
+    const electronPath = require('electron') as unknown as string;
+    const child = spawn(electronPath, ['.', '--bench'], {
+      env: {
+        ...process.env,
+        ELECTRON_RENDERER_URL: '',
+        BLISZ_BENCH_CONFIG: configPath,
+        TEMP: profileParent,
+        TMP: profileParent,
+      },
+    });
+    let output = '';
+    child.stdout.on('data', (chunk) => {
+      output += chunk;
+    });
+    child.stderr.on('data', (chunk) => {
+      output += chunk;
+    });
+    const exitCode = await new Promise<number | null>((resolve) => child.on('exit', resolve));
+
+    expect(exitCode, output).toBe(0);
+    expect(output).toMatch(/Total private: [\d.]+ MB, working set: [\d.]+ MB/);
+    expect(output).toContain('Tabs finished loading:');
+    // Windows runs the PowerShell part; other platforms print a note instead.
+    expect(output).toMatch(/Total private working set: [\d.]+ MB|Private working set skipped/);
+    // A detached process deletes the profile just after the app exits.
+    await expect.poll(() => readdirSync(profileParent), { timeout: 15_000 }).toEqual([]);
+  } finally {
+    server.closeAllConnections();
+    server.close();
+    rmSync(temp, { recursive: true, force: true, maxRetries: 5 });
   }
 });
