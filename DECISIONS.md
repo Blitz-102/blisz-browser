@@ -2,6 +2,35 @@
 
 Newest at the top. Each entry: what was chosen, what else was considered, why, and when to revisit.
 
+## 2026-10-15: Tab sleeping, manual (Phase 3 step 3a)
+- Chosen:
+  - **Sleep:**
+    - "Sleep tab" in the tab menu.
+    - It saves the tab's web history entries and active index, keeps the title and favicon, and closes the page's webContents, which frees its renderer.
+    - **Never slept:** the active tab, a tab whose current entry isn't http(s) (such as an `about:blank` popup), and a tab whose popups are still open (sleeping it would break `window.opener`, and OAuth with it).
+  - **Wake:**
+    - Activating the tab creates a fresh view and calls `navigationHistory.restore()`.
+    - Until the first commit, the tab shows its saved URL and title.
+    - A bare abort keeps the tab in that state; Reload restarts the restore.
+    - A real failure shows the error card.
+  - **Checks while waking:**
+    - `restore()` skips `will-navigate`, so the scheme rule is enforced in three places:
+      - entries are filtered with `isWebUrl` when saved;
+      - while restoring, a non-web main-frame start is stopped;
+      - a non-web commit discards the view and shows an error card.
+    - Listeners on a slept or replaced view are ignored (`tab.view !== view`).
+- Constraint (later steps):
+  - `pageState` holds form values and POST bodies, which can include passwords. It stays in memory only, is never logged, and is never written to disk. Session restore (3d) stores `{url, title}` only and validates every entry read back.
+  - Auto-sleep (3b) also skips tabs that are audible, loading, using the camera or mic, downloading, or have pending prompts.
+- Alternatives considered:
+  - loading a placeholder page instead of destroying the view;
+  - a UI `tabs:sleep` IPC (removed; sleeping goes through the native menu only).
+- Why: PLAN 5.2's biggest memory lever, plus the step 3a code and security reviews.
+- Revisit if:
+  - Electron adds a way to discard a tab natively;
+  - opening local `file:` pages is planned (then also block `file:` on the page session).
+- Status: settled
+
 ## 2026-10-14: Memory budget is to stay below Brave's
 - Chosen: on the `bench/sites.json` tab set, Blisz's total private working set must stay below Brave's (same method, `scripts/measure-memory.ps1` and `scripts/bench-brave.ps1`, medians of three runs). This is the user's rule.
 - First result (2026-10-14, see `docs/perf-log.md`): Blisz 1,264 MB against Brave 1,094 MB. **The budget is not met yet.**

@@ -97,7 +97,7 @@
   }
 }
 
-/* Not used yet: Phase 3 marks sleeping tabs with these. */
+/* Sleeping tabs: the page view is destroyed until the tab is selected. */
 .faviconSleeping {
   border: var(--border-width) dashed var(--color-text-muted);
   opacity: var(--sleeping-opacity);

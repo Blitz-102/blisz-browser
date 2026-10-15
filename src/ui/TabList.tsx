@@ -52,18 +52,32 @@ export function TabList({
             <button
               type="button"
               className={styles.select}
+              aria-description={tab.sleeping ? 'Sleeping' : undefined}
               aria-current={isActive ? 'page' : undefined}
               aria-busy={tab.isLoading}
               onClick={() => onSelect(tab.id)}
             >
               {tab.favicon ? (
-                <img className={styles.faviconImage} src={tab.favicon} alt="" />
+                <img
+                  className={
+                    tab.sleeping
+                      ? `${styles.faviconImage} ${styles.faviconSleeping}`
+                      : styles.faviconImage
+                  }
+                  src={tab.favicon}
+                  alt=""
+                />
               ) : (
-                <span className={styles.favicon} aria-hidden="true">
+                <span
+                  className={
+                    tab.sleeping ? `${styles.favicon} ${styles.faviconSleeping}` : styles.favicon
+                  }
+                  aria-hidden="true"
+                >
                   {Array.from(label)[0]?.toUpperCase()}
                 </span>
               )}
-              <span className={styles.title}>{label}</span>
+              <span className={tab.sleeping ? styles.titleSleeping : styles.title}>{label}</span>
               {tab.isLoading && <span className={styles.spinner} aria-hidden="true" />}
             </button>
             <button

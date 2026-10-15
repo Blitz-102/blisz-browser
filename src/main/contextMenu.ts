@@ -100,10 +100,11 @@ export function popupPageMenu(
 // The menu for a right-click on a tab row in the sidebar.
 export function popupTabMenu(
   window: BaseWindow,
-  actions: { duplicate(): void; close(): void },
+  actions: { duplicate(): void; close(): void; canSleep: boolean; sleep(): void },
 ): void {
   Menu.buildFromTemplate([
     { label: 'Duplicate', click: actions.duplicate },
+    { label: 'Sleep tab', enabled: actions.canSleep, click: actions.sleep },
     { label: 'Close', click: actions.close },
   ]).popup({ window });
 }

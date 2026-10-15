@@ -8,7 +8,7 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs';
-import { createServer, type ServerResponse } from 'node:http';
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -461,6 +461,8 @@ const FIXTURE_PAGES: Record<string, string> = {
   '/links':
     '<title>Fixture links</title><a href="/popup">One</a> <a href="/popup">Two</a> <a href="/popup">Three</a>',
   '/text': '<title>Fixture text</title><p>needle one, needle two, needle three</p>',
+  '/arm': '<title>Fixture arm</title><button onclick="window.close()">Close me</button>',
+  '/blank': `<title>Fixture blank</title><button onclick="window.open('about:blank')">Open blank</button>`,
 };
 
 async function startFixture(): Promise<{ home: string; stop: () => void }> {
@@ -1567,5 +1569,297 @@ test('--bench opens the configured sites, prints the totals and removes its temp
     server.closeAllConnections();
     server.close();
     rmSync(temp, { recursive: true, force: true, maxRetries: 5 });
+  }
+});
+
+// Pops the tab menu for `id` without a real right-click and returns whether "Sleep tab" was enabled.
+// With `choose` it also picks the item, as a click would.
+async function tabMenuSleep(
+  app: ElectronApplication,
+  ui: Page,
+  id: number,
+  choose = false,
+): Promise<boolean | undefined> {
+  await app.evaluate(({ Menu }, choose) => {
+    const store = globalThis as { sleepEnabled?: boolean };
+    store.sleepEnabled = undefined;
+    Menu.prototype.popup = function () {
+      const item = this.items.find((entry) => entry.label === 'Sleep tab');
+      store.sleepEnabled = item?.enabled;
+      if (choose && item?.enabled) item.click();
+    };
+  }, choose);
+  await ui.evaluate(`window.bliss.tabContextMenu(${id})`);
+  return app.evaluate(() => (globalThis as { sleepEnabled?: boolean }).sleepEnabled);
+}
+
+// The fixture site plus a second site (localhost is not 127.0.0.1, so it gets its own renderer) with
+// a background tab that went through "text" and then "links". The first tab stays active.
+async function openSleepSession() {
+  const session = await openFixtureSession();
+  const { ui, home, openerId, getState } = session;
+  const site = home.replace('127.0.0.1', 'localhost');
+  const tabId = await ui.evaluate<number>('window.bliss.createTab()');
+  const findTab = async () => (await getState()).tabs.find((tab) => tab.id === tabId);
+  for (const [path, title] of [
+    ['text', 'Fixture text'],
+    ['links', 'Fixture links'],
+  ]) {
+    await ui.evaluate(`window.bliss.navigateTab(${tabId}, '${site}${path}')`);
+    await expect.poll(async () => (await findTab())?.title).toBe(title);
+  }
+  await ui.evaluate(`window.bliss.activateTab(${openerId})`);
+  return { ...session, site, tabId, findTab };
+}
+
+test('a background tab sleeps without its renderer and wakes with its history', async () => {
+  const { app, ui, site, tabId, openerId, findTab, getState, pageAt, close } =
+    await openSleepSession();
+  try {
+    // The active tab can't sleep.
+    await ui.evaluate(`window.bliss.activateTab(${tabId})`);
+    expect(await tabMenuSleep(app, ui, tabId)).toBe(false);
+    await ui.evaluate(`window.bliss.activateTab(${openerId})`);
+    expect(await tabMenuSleep(app, ui, tabId)).toBe(true);
+
+    const pid = await app.evaluate(
+      ({ webContents }, url) =>
+        webContents
+          .getAllWebContents()
+          .find((contents) => contents.getURL() === url)
+          ?.getOSProcessId(),
+      `${site}links`,
+    );
+    expect(pid).toBeGreaterThan(0);
+    await tabMenuSleep(app, ui, tabId, true);
+    await expect.poll(async () => (await findTab())?.sleeping).toBe(true);
+    await expect
+      .poll(() => app.evaluate(({ app }) => app.getAppMetrics().map((metric) => metric.pid)))
+      .not.toContain(pid);
+    expect(await findTab()).toMatchObject({
+      url: `${site}links`,
+      title: 'Fixture links',
+      canGoBack: true,
+      canGoForward: false,
+      isLoading: false,
+    });
+    const sleepingRow = ui.getByRole('button', { name: 'Fixture links', description: 'Sleeping' });
+    await expect(sleepingRow).toBeVisible();
+    expect(await tabMenuSleep(app, ui, tabId)).toBe(false); // already asleep
+
+    // Clicking the tab wakes it: same page, same history, same user agent token.
+    await sleepingRow.click();
+    await expect.poll(async () => (await findTab())?.sleeping).toBe(false);
+    await expect.poll(async () => (await getState()).activeId).toBe(tabId);
+    await expect.poll(async () => (await findTab())?.isLoading).toBe(false);
+    expect(await findTab()).toMatchObject({
+      url: `${site}links`,
+      title: 'Fixture links',
+      canGoBack: true,
+    });
+    await expect
+      .poll(async () => pageAt(`${site}links`).evaluate('navigator.userAgent'))
+      .toContain('Blisz/');
+    await expect(ui.getByRole('textbox', { name: 'Address' })).not.toBeFocused();
+
+    await ui.evaluate(`window.bliss.tabGo(${tabId}, 'back')`);
+    await expect.poll(async () => (await findTab())?.url).toBe(`${site}text`);
+  } finally {
+    await close();
+  }
+});
+
+test('a sleeping tab can be duplicated and closed', async () => {
+  const { app, ui, site, tabId, openerId, findTab, getState, close } = await openSleepSession();
+  try {
+    await tabMenuSleep(app, ui, tabId, true);
+    await expect.poll(async () => (await findTab())?.sleeping).toBe(true);
+
+    // The copy opens the saved page; the source stays asleep.
+    const copyId = await ui.evaluate<number>(`window.bliss.duplicateTab(${tabId})`);
+    await expect
+      .poll(async () => (await getState()).tabs.find((tab) => tab.id === copyId)?.url)
+      .toBe(`${site}links`);
+    expect((await findTab())?.sleeping).toBe(true);
+
+    // Closing a sleeping tab removes it.
+    await ui.evaluate(`window.bliss.activateTab(${openerId})`);
+    await ui.evaluate(`window.bliss.closeTab(${tabId})`);
+    await expect.poll(async () => (await getState()).order).not.toContain(tabId);
+    expect((await getState()).activeId).toBe(openerId);
+  } finally {
+    await close();
+  }
+});
+
+test('a restore that is stuck can be slept again or stopped, and Reload restarts it', async () => {
+  let slowRequests = 0;
+  let release = false;
+  const server = createServer((request, response) => {
+    response.setHeader('Content-Type', 'text/html');
+    response.setHeader('Cache-Control', 'no-store'); // a restore would otherwise come from the cache
+    if (request.url === '/slow') {
+      slowRequests++;
+      // The first load answers; the restore after sleeping hangs until released.
+      if (slowRequests > 1 && !release) return;
+      response.end('<title>Fixture slow</title><p>Slow</p>');
+    } else {
+      response.end('<title>Fixture first</title><p>First</p>');
+    }
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const app = await launch();
+  try {
+    const ui = await findUi(app);
+    const getState = () => ui.evaluate<TabsState>('window.bliss.getTabsState()');
+    const [firstId = 0] = (await getState()).order;
+    const tabId = await ui.evaluate<number>('window.bliss.createTab()');
+    const findTab = async () => (await getState()).tabs.find((tab) => tab.id === tabId);
+    for (const [path, title] of [
+      ['/', 'Fixture first'],
+      ['/slow', 'Fixture slow'],
+    ]) {
+      await ui.evaluate(`window.bliss.navigateTab(${tabId}, '${base}${path}')`);
+      await expect.poll(async () => (await findTab())?.title).toBe(title);
+    }
+    await ui.evaluate(`window.bliss.activateTab(${firstId})`);
+    await tabMenuSleep(app, ui, tabId, true);
+    await expect.poll(async () => (await findTab())?.sleeping).toBe(true);
+
+    await ui.evaluate(`window.bliss.activateTab(${tabId})`);
+    await expect.poll(() => slowRequests).toBe(2);
+    expect(await findTab()).toMatchObject({
+      url: `${base}/slow`,
+      title: 'Fixture slow',
+      sleeping: false,
+      canGoBack: false,
+    });
+
+    // Sleeping while the restore is stuck keeps the page and history.
+    await ui.evaluate(`window.bliss.activateTab(${firstId})`);
+    await tabMenuSleep(app, ui, tabId, true);
+    await expect.poll(async () => (await findTab())?.sleeping).toBe(true);
+    expect(await findTab()).toMatchObject({ url: `${base}/slow`, canGoBack: true });
+    await ui.evaluate(`window.bliss.activateTab(${tabId})`);
+    await expect.poll(() => slowRequests).toBe(3);
+
+    await ui.evaluate(`window.bliss.tabGo(${tabId}, 'stop')`);
+    await expect.poll(async () => (await findTab())?.isLoading).toBe(false);
+    expect(slowRequests).toBe(3); // a stop is not answered by a second load
+    expect((await findTab())?.url).toBe(`${base}/slow`);
+
+    release = true;
+    await ui.evaluate(`window.bliss.tabGo(${tabId}, 'reload')`);
+    await expect.poll(async () => (await findTab())?.isLoading).toBe(false);
+    await expect.poll(async () => (await findTab())?.canGoBack).toBe(true);
+    expect(await findTab()).toMatchObject({ url: `${base}/slow`, title: 'Fixture slow' });
+  } finally {
+    await app.close();
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
+test('a woken page can still close its own tab', async () => {
+  const { app, ui, site, tabId, openerId, findTab, getState, pageAt, close } =
+    await openSleepSession();
+  try {
+    await ui.evaluate(`window.bliss.navigateTab(${tabId}, '${site}arm')`);
+    await expect.poll(async () => (await findTab())?.title).toBe('Fixture arm');
+    await ui.evaluate(`window.bliss.activateTab(${openerId})`);
+    await tabMenuSleep(app, ui, tabId, true);
+    await expect.poll(async () => (await findTab())?.sleeping).toBe(true);
+
+    await ui.evaluate(`window.bliss.activateTab(${tabId})`);
+    await expect.poll(async () => (await findTab())?.sleeping).toBe(false);
+    await expect.poll(async () => (await findTab())?.title).toBe('Fixture arm');
+    await expect
+      .poll(() => app.windows().some((window) => window.url() === `${site}arm`))
+      .toBe(true);
+    await pageAt(`${site}arm`).getByRole('button', { name: 'Close me' }).click();
+    await expect.poll(async () => (await getState()).order).not.toContain(tabId);
+    expect((await getState()).activeId).toBe(openerId);
+  } finally {
+    await close();
+  }
+});
+
+test('an about:blank popup cannot be put to sleep', async () => {
+  const { app, ui, home, openerId, getState, pageAt, close } = await openFixtureSession();
+  try {
+    await ui.evaluate(`window.bliss.navigateTab(${openerId}, '${home}blank')`);
+    await expect.poll(async () => (await getState()).tabs[0]?.title).toBe('Fixture blank');
+    await pageAt(`${home}blank`).getByRole('button', { name: 'Open blank' }).click();
+    await expect.poll(async () => (await getState()).order.length).toBe(2);
+    const popupId = (await getState()).order[1] ?? 0;
+    await ui.evaluate(`window.bliss.activateTab(${openerId})`);
+    expect(await tabMenuSleep(app, ui, popupId)).toBe(false);
+    expect(await tabMenuSleep(app, ui, openerId ?? 0)).toBe(false); // the active tab
+  } finally {
+    await close();
+  }
+});
+
+test('a restore that fails shows the error card, and Try again works once the site is back', async () => {
+  const handler = (_request: IncomingMessage, response: ServerResponse) => {
+    response.setHeader('Content-Type', 'text/html');
+    response.setHeader('Cache-Control', 'no-store');
+    response.end('<title>Fixture back</title><p>Back</p>');
+  };
+  const server = createServer(handler);
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address() as AddressInfo;
+  const url = `http://127.0.0.1:${port}/`;
+  const app = await launch();
+  try {
+    const ui = await findUi(app);
+    const getState = () => ui.evaluate<TabsState>('window.bliss.getTabsState()');
+    const [firstId = 0] = (await getState()).order;
+    const tabId = await ui.evaluate<number>('window.bliss.createTab()');
+    const findTab = async () => (await getState()).tabs.find((tab) => tab.id === tabId);
+    await ui.evaluate(`window.bliss.navigateTab(${tabId}, '${url}')`);
+    await expect.poll(async () => (await findTab())?.title).toBe('Fixture back');
+    await ui.evaluate(`window.bliss.activateTab(${firstId})`);
+    await tabMenuSleep(app, ui, tabId, true);
+    await expect.poll(async () => (await findTab())?.sleeping).toBe(true);
+
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await ui.evaluate(`window.bliss.activateTab(${tabId})`);
+    const card = ui.getByRole('region', { name: "Can't reach this page" });
+    await expect(card).toBeVisible();
+    expect((await findTab())?.sleeping).toBe(false);
+
+    const revived = createServer(handler);
+    await new Promise<void>((resolve) => revived.listen(port, '127.0.0.1', resolve));
+    try {
+      await card.getByRole('button', { name: 'Try again' }).click();
+      await expect.poll(async () => (await findTab())?.title).toBe('Fixture back');
+      await expect(card).toHaveCount(0);
+    } finally {
+      revived.closeAllConnections();
+      revived.close();
+    }
+  } finally {
+    await app.close();
+  }
+});
+
+test('a tab with an open popup cannot be put to sleep', async () => {
+  const { app, ui, home, openerId, getState, pageAt, close } = await openFixtureSession();
+  try {
+    await pageAt(home).getByRole('link', { name: 'Open popup' }).click();
+    await expect.poll(async () => (await getState()).order.length).toBe(2);
+    const popupId = (await getState()).order[1] ?? 0;
+    await ui.evaluate(`window.bliss.activateTab(${popupId})`);
+    expect(await tabMenuSleep(app, ui, openerId ?? 0)).toBe(false); // window.opener would break
+
+    await ui.evaluate(`window.bliss.closeTab(${popupId})`);
+    const otherId = await ui.evaluate<number>('window.bliss.createTab()');
+    expect(otherId).toBeGreaterThan(0);
+    expect(await tabMenuSleep(app, ui, openerId ?? 0)).toBe(true);
+  } finally {
+    await close();
   }
 });

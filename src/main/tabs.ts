@@ -2,6 +2,7 @@ import {
   app,
   type BaseWindow,
   type HandlerDetails,
+  type NavigationEntry,
   session,
   shell,
   type WebContents,
@@ -116,6 +117,12 @@ interface Tab {
   openedAt: number; // when the user opened this tab; until its first navigation commits it may start one download
   isPopup: boolean; // created by window.open or target=_blank
   committed: boolean; // a main-frame navigation has committed; a popup that never did is download-only
+  // History saved when the tab went to sleep (in memory only, never logged: pageState can hold form
+  // data). sleepState set and view null = asleep; both set = restoring, nothing committed yet, the
+  // saved entry stands in for url and title; sleepState null = normal. A restore that crashes keeps
+  // sleepState with error 'crashed' (Reload rebuilds the view); one that fails to load clears it and
+  // shows the error card.
+  sleepState: { entries: NavigationEntry[]; index: number } | null;
 }
 
 // The page area as distances from the window edges, so a window resize can be applied at once.
@@ -215,22 +222,25 @@ function attachPage(tab: Tab, view: WebContentsView): void {
   tab.view = view;
   pageContents.add(contents);
   handleShortcuts(contents);
-  contents.setWindowOpenHandler((details) => handleWindowOpen(tab, details));
+  contents.setWindowOpenHandler((details) =>
+    tab.view === view ? handleWindowOpen(tab, details) : { action: 'deny' },
+  );
   contents.on('input-event', (_event, input) => {
-    if (POPUP_INPUT_TYPES.has(input.type)) tab.lastInputAt = Date.now();
+    if (tab.view === view && POPUP_INPUT_TYPES.has(input.type)) tab.lastInputAt = Date.now();
   });
   // A link opened from DevTools becomes a tab, web URLs only (never shell.openExternal).
   contents.on('devtools-open-url', (_event, url) => {
     if (isWebUrl(url)) navigate(createTab(), url);
   });
-  contents.on('context-menu', (_event, params) =>
+  contents.on('context-menu', (_event, params) => {
+    if (tab.view !== view) return;
     popupPageMenu(window, contents, params, {
       openTab: (url, options) => openInNewTab(tab, url, options),
       saveImage: (url) => saveAs(tab, url, 'save-image'),
       saveLink: (url) => saveAs(tab, url, 'save-link'),
-    }),
-  );
-  watchPageEvents(tab, contents);
+    });
+  });
+  watchPageEvents(tab, view);
 }
 
 // The index right after `tab` and the popups it opened, so they keep their order.
@@ -399,33 +409,46 @@ function respondToPrompt(id: number, allow: boolean): void {
   queueUpdate(tab.id);
 }
 
+function savedEntry(tab: Tab): NavigationEntry | undefined {
+  return tab.sleepState?.entries[tab.sleepState.index];
+}
+
 function readInfo(tab: Tab): TabInfo {
+  const { sleepState } = tab;
+  const saved = savedEntry(tab);
+  const base: TabInfo = {
+    id: tab.id,
+    url: saved?.url ?? '',
+    title: saved?.title ?? '',
+    isLoading: false,
+    canGoBack: false,
+    canGoForward: false,
+    favicon: tab.favicon,
+    blockedPopups: 0,
+    blockedDownloads: 0,
+    zoom: 1,
+    prompt: null,
+    fullscreenNotice: null,
+    sleeping: !tab.view && sleepState !== null,
+    error: null,
+  };
   if (!tab.view) {
+    if (!sleepState) return base;
     return {
-      id: tab.id,
-      url: '',
-      title: '',
-      isLoading: false,
-      canGoBack: false,
-      canGoForward: false,
-      favicon: null,
-      blockedPopups: 0,
-      blockedDownloads: 0,
-      zoom: 1,
-      prompt: null,
-      fullscreenNotice: null,
-      error: null,
+      ...base,
+      canGoBack: sleepState.index > 0,
+      canGoForward: sleepState.index < sleepState.entries.length - 1,
     };
   }
   const contents = tab.view.webContents;
+  // While restoring there is no history to go through yet, and the url is empty until the commit.
   return {
-    id: tab.id,
-    url: contents.getURL(),
-    title: contents.getTitle(),
+    ...base,
+    url: saved?.url ?? contents.getURL(),
+    title: saved ? saved.title : contents.getTitle(),
     isLoading: contents.isLoading(),
-    canGoBack: contents.navigationHistory.canGoBack(),
-    canGoForward: contents.navigationHistory.canGoForward(),
-    favicon: tab.favicon,
+    canGoBack: !saved && contents.navigationHistory.canGoBack(),
+    canGoForward: !saved && contents.navigationHistory.canGoForward(),
     blockedPopups: tab.blockedPopups,
     blockedDownloads: tab.blockedDownloads,
     zoom: Math.round(contents.getZoomFactor() * 100) / 100,
@@ -551,31 +574,56 @@ function setPageArea(area: PageArea): void {
   layout();
 }
 
-function watchPageEvents(tab: Tab, contents: WebContents): void {
+function watchPageEvents(tab: Tab, view: WebContentsView): void {
+  const contents = view.webContents;
   const onChange = () => queueUpdate(tab.id);
   contents.on('did-start-loading', onChange);
   contents.on('did-stop-loading', onChange);
   // A new page load drops the old error.
   contents.on('did-start-navigation', (details) => {
-    if (!details.isMainFrame || details.isSameDocument) return;
+    if (tab.view !== view || !details.isMainFrame || details.isSameDocument) return;
+    // Backstop for a restore, which is started by main and skips will-navigate (a page's own
+    // navigations are checked there). about:blank is what OAuth popups start with.
+    if (tab.sleepState && details.url !== 'about:blank' && !isWebUrl(details.url)) {
+      // Not inside the event: stopping a navigation that is still starting can take the app down.
+      setImmediate(() => {
+        if (!contents.isDestroyed()) contents.stop();
+      });
+      return;
+    }
     setError(tab, null);
     onChange();
   });
   contents.on('did-fail-load', (_event, code, description, url, isMainFrame) => {
+    if (tab.view !== view) return;
     const error = isMainFrame ? loadError(code, description, url) : null; // a trailing -3 changes nothing
-    if (error) setError(tab, error);
+    if (!error) return;
+    setError(tab, error);
+    tab.sleepState = null; // a failed restore shows the error card like any failed load
+    onChange();
   });
   contents.on('render-process-gone', (_event, details) => {
-    if (details.reason === 'clean-exit') return;
+    if (tab.view !== view || details.reason === 'clean-exit') return;
     tab.prompts.cancelAll();
     dropHtmlFullscreen(tab);
     setError(tab, { kind: 'crashed' });
     onChange();
   });
-  contents.on('did-navigate', () => {
+  contents.on('did-navigate', (_event, url) => {
+    if (tab.view !== view) return;
+    // The deferred stop above can lose the race; whatever committed must still be a web page.
+    if (url !== 'about:blank' && !isWebUrl(url)) {
+      tab.sleepState = null;
+      discardView(tab);
+      setError(tab, { kind: 'network', code: -301, description: 'ERR_DISALLOWED_URL_SCHEME', url });
+      return;
+    }
     tab.prompts.cancelAll(); // questions belong to the page that asked
     setError(tab, null);
-    resetFavicon(tab);
+    // A woken tab keeps the favicon it slept with; page-favicon-updated refreshes it.
+    const restoredSamePage = savedEntry(tab)?.url === contents.getURL();
+    tab.sleepState = null;
+    if (!restoredSamePage) resetFavicon(tab);
     tab.blockedPopups = 0;
     tab.blockedDownloads = 0;
     tab.committed = true;
@@ -584,9 +632,10 @@ function watchPageEvents(tab: Tab, contents: WebContents): void {
     if (tab.id === activeId) closeFind();
     onChange();
   });
-  contents.on('did-navigate-in-page', onChange);
-  contents.on('page-title-updated', onChange);
+  contents.on('did-navigate-in-page', () => tab.view === view && onChange());
+  contents.on('page-title-updated', () => tab.view === view && onChange());
   contents.on('enter-html-full-screen', () => {
+    if (tab.view !== view) return;
     if (tab.id !== activeId) {
       requestExitFullscreen(contents); // only the tab in view may take over the window
       restoreWindowSoon();
@@ -603,12 +652,15 @@ function watchPageEvents(tab: Tab, contents: WebContents): void {
     queueUpdate(tab.id);
     layout();
   });
-  contents.on('leave-html-full-screen', () => leaveHtmlFullscreen(tab));
+  contents.on('leave-html-full-screen', () => {
+    if (tab.view === view) leaveHtmlFullscreen(tab);
+  });
   contents.on('page-favicon-updated', (_event, favicons) => {
+    if (tab.view !== view) return;
     loadFavicon(tab, webFaviconUrls(favicons));
   });
   contents.on('found-in-page', (_event, result) => {
-    if (!result.finalUpdate || tab.id !== activeId || ui.isDestroyed()) return;
+    if (tab.view !== view || !result.finalUpdate || tab.id !== activeId || ui.isDestroyed()) return;
     const found: FindResult = {
       tabId: tab.id,
       activeMatchOrdinal: result.activeMatchOrdinal,
@@ -617,11 +669,13 @@ function watchPageEvents(tab: Tab, contents: WebContents): void {
     ui.send('find:result', found);
   });
   // Ctrl+scroll asks for a zoom step.
-  contents.on('zoom-changed', (_event, direction) => stepZoom(contents, direction));
+  contents.on('zoom-changed', (_event, direction) => {
+    if (tab.view === view) stepZoom(contents, direction);
+  });
   // A page can close its own webContents (window.close()); the tab closes like in other browsers.
   contents.once('destroyed', () => {
-    // closeTab or a closing window got here first.
-    if (window.isDestroyed() || !tabs.includes(tab)) return;
+    // closeTab or a closing window got here first, or the tab went to sleep and has no view.
+    if (window.isDestroyed() || !tabs.includes(tab) || tab.view !== view) return;
     // The view's webContents is gone, so closeTab must not touch it.
     if (attachedView === tab.view) detachView();
     tab.view = null;
@@ -710,6 +764,7 @@ function navigate(tab: Tab, input: string): boolean {
     if (target !== '' && !app.isPackaged) console.warn(`Refused to navigate to ${target}`);
     return false;
   }
+  tab.sleepState = null; // the user is going elsewhere; there is nothing left to restore
   if (!tab.view) attachPage(tab, createView());
   // Failures are reported through did-fail-load (error pages come in a later step).
   tab.view?.webContents.loadURL(new URL(target).href).catch(() => {});
@@ -740,6 +795,7 @@ function addTab(index: number): Tab {
     openedAt: 0,
     isPopup: false,
     committed: false,
+    sleepState: null,
   };
   tabs.splice(index, 0, tab);
   queueUpdate(tab.id); // sends the new tab's full info
@@ -756,9 +812,75 @@ function activateTab(tab: Tab): void {
   }
   activeId = tab.id;
   queueStructureUpdate();
+  if (tab.sleepState && !tab.view) wakeTab(tab, tab.sleepState);
   if (tab.view) focusOnAttach = true;
   else ui.focus();
   layout();
+}
+
+// A fresh view takes the saved history back; restore() loads the active entry itself.
+function wakeTab(tab: Tab, { entries, index }: NonNullable<Tab['sleepState']>): void {
+  const view = createView();
+  attachPage(tab, view);
+  const contents = view.webContents;
+  try {
+    // A rejection only means the load was stopped or failed, which did-fail-load already handles.
+    // Retrying it would undo a Stop.
+    contents.navigationHistory.restore({ index, entries }).catch(() => {});
+  } catch {
+    // Unusable saved history: load the page itself, without its back and forward entries.
+    const url = entries[index]?.url;
+    if (url && isWebUrl(url)) contents.loadURL(url).catch(() => {});
+  }
+  queueUpdate(tab.id);
+}
+
+// The history a sleeping tab keeps: web URLs only, so a restore never loads anything else. Null when
+// the tab can't sleep (active, no view, has open popups, or its current page isn't a web page, like an
+// about:blank popup).
+function historyToSave(tab: Tab): NonNullable<Tab['sleepState']> | null {
+  if (tab.id === activeId || !tab.view || tab.view.webContents.isDestroyed()) return null;
+  // Sleeping the opener of an open popup would cut window.opener, which sign-in flows rely on.
+  if (tabs.some((other) => other.opener === tab)) return null;
+  if (tab.sleepState) return tab.sleepState; // still restoring: nothing newer than what was saved
+  const { navigationHistory } = tab.view.webContents;
+  const entries = navigationHistory.getAllEntries();
+  const current = entries[navigationHistory.getActiveIndex()];
+  if (!current || !isWebUrl(current.url)) return null;
+  const kept = entries.filter((entry) => isWebUrl(entry.url));
+  return { entries: kept, index: kept.indexOf(current) };
+}
+
+// Destroys the page view, which frees its renderer, and keeps what the sidebar and wakeTab need.
+function sleepTab(tab: Tab): void {
+  const saved = historyToSave(tab);
+  if (!saved) return;
+  tab.sleepState = saved;
+  tab.faviconFetch?.abort();
+  tab.faviconFetch = null;
+  tab.faviconKey = ''; // the favicon itself stays for the sidebar
+  tab.prompts.cancelAll();
+  dropHtmlFullscreen(tab);
+  clearTimeout(tab.noticeTimer);
+  tab.error = null;
+  tab.blockedPopups = 0;
+  tab.blockedDownloads = 0;
+  tab.saveRequest = null;
+  tab.recentPopups = [];
+  tab.recentDownloads = [];
+  tab.lastInputAt = 0;
+  tab.openedAt = 0;
+  discardView(tab);
+  queueUpdate(tab.id);
+}
+
+// Closes the page view. tab.view is cleared first so the old contents' late events are ignored.
+function discardView(tab: Tab): void {
+  const { view } = tab;
+  if (!view) return;
+  if (attachedView === view) detachView();
+  tab.view = null;
+  if (!view.webContents.isDestroyed()) view.webContents.close();
 }
 
 function createTab(): Tab {
@@ -770,7 +892,8 @@ function createTab(): Tab {
 function duplicateTab(source: Tab): Tab {
   const tab = addTab(tabs.indexOf(source) + 1);
   activateTab(tab);
-  if (source.view) navigate(tab, source.view.webContents.getURL());
+  const url = savedEntry(source)?.url ?? source.view?.webContents.getURL();
+  if (url) navigate(tab, url);
   return tab;
 }
 
@@ -782,11 +905,7 @@ function closeTab(tab: Tab): void {
   tab.faviconFetch?.abort();
   tab.prompts.cancelAll();
   dropHtmlFullscreen(tab);
-  if (tab.view) {
-    if (attachedView === tab.view) detachView();
-    if (!tab.view.webContents.isDestroyed()) tab.view.webContents.close();
-    tab.view = null;
-  }
+  discardView(tab);
   if (tab.id !== activeId) return;
   for (const other of tabs) {
     if (other.opener === tab) other.opener = null;
@@ -831,6 +950,15 @@ export function getTabProcessLabels(): Map<number, string> {
 
 function go(tab: Tab, action: TabAction): void {
   if (!tab.view) return;
+  if (tab.sleepState) {
+    // Restoring: nothing has committed, so there is no history to walk. Reload starts the restore over.
+    if (action === 'reload') {
+      discardView(tab);
+      wakeTab(tab, tab.sleepState);
+      layout();
+    } else if (action === 'stop') tab.view.webContents.stop();
+    return;
+  }
   const contents = tab.view.webContents;
   if (action === 'back') contents.navigationHistory.goBack();
   else if (action === 'forward') contents.navigationHistory.goForward();
@@ -1060,6 +1188,10 @@ export function initTabs(appWindow: BaseWindow, uiContents: WebContents): Electr
       },
       close: () => {
         if (tabs.includes(tab)) closeTab(tab);
+      },
+      canSleep: historyToSave(tab) !== null,
+      sleep: () => {
+        if (tabs.includes(tab)) sleepTab(tab);
       },
     });
   });

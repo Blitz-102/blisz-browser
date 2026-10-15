@@ -15,6 +15,7 @@ const tab: TabInfo = {
   zoom: 1,
   prompt: null,
   fullscreenNotice: null,
+  sleeping: false,
   error: null,
 };
 

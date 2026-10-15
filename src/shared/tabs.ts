@@ -35,6 +35,7 @@ export interface TabInfo {
   zoom: number; // zoom factor, 1 = 100%
   prompt: PromptInfo | null; // the oldest pending question; the rest of the queue stays in main
   fullscreenNotice: string | null; // origin of a page that just went fullscreen, for a few seconds
+  sleeping: boolean; // the page view is destroyed; url, title, favicon and history are kept
   error: TabError | null; // set while the page failed to load or crashed; the UI shows a card instead
 }
 
