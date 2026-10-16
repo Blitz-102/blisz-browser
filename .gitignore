@@ -12,3 +12,8 @@ test-results/
 PLAN.md
 CLAUDE.md
 .claude/
+
+# Local documentation and notes
+docs/benchmarking.md
+docs/perf-log.md
+DECISIONS.md
