@@ -2,6 +2,23 @@
 
 Newest at the top. Each entry: what was chosen, what else was considered, why, and when to revisit.
 
+## 2026-11-19: Tab sleeping, automatic (Phase 3 step 3b)
+- Chosen:
+  - **When:** a sweep every 60 s puts a background tab to sleep after 30 minutes idle, or after 5 minutes when free system memory is under 1 GB. The rule lives in `sleep.ts` (`sleepLimitMs`, `shouldAutoSleep`). "Idle" counts from when the tab was created, left the foreground or stopped playing audio.
+  - **Never auto-slept** (on top of the 3a rules): audible, camera or mic allowed, download running or waiting for its dialog, loading, permission prompt open, popup open, DevTools open.
+  - **beforeunload:** the page gets its beforeunload check first (`close({ waitForBeforeUnload: true })`). A veto is never overridden and no dialog is shown; the tab stays awake and its idle clock restarts. Pages the user never interacted with get no veto, because Chromium skips beforeunload for them.
+  - **Pending sleep:** while the page answers beforeunload, one field (`tab.sleepRequest`: the view plus the saved history) marks the close as ours, so its destroy is finished as a sleep and never as a closed tab. There is no timeout: a hung page simply stays awake and isn't asked again. The request is cleared by a veto, a crash, a typed address (which wins over the close) or a menu sleep. If the page navigates meanwhile, the saved history is refreshed.
+  - **Dev override:** `BLISZ_SLEEP_AFTER_MS` (at least 1000) replaces the idle limit, development builds only (`!app.isPackaged`), so tests don't wait 30 minutes.
+  - **Bench:** it now measures twice, before and after sleeping every background tab (`sleepBackgroundTabs`).
+- Known limits:
+  - `mediaInUse` is set when camera or mic is allowed and cleared on the next page load or on sleep, so a tab that stopped using the device stays awake until then.
+  - A page can stay awake on purpose (looping audio, never finishing loading). That costs memory, not security.
+  - Activating the tab, or a popup or download starting, while the beforeunload check is in flight is accepted: the tab sleeps and (if active) wakes again at once.
+- Alternatives considered: sleeping without the beforeunload check (rejected: loses unsaved form data); overriding a veto after a timeout (rejected: same reason); tracking real capture state instead of the camera/mic grant (later, if it matters).
+- Why: PLAN 5.2's biggest memory lever, the first rule being "never lose what the user is doing".
+- Revisit if: the after-sleep benchmark still isn't below Brave's, or idle limits feel wrong in daily use.
+- Status: provisional (the limits are untuned until you've used it)
+
 ## 2026-10-15: Tab sleeping, manual (Phase 3 step 3a)
 - Chosen:
   - **Sleep:**

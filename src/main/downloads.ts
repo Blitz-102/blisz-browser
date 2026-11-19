@@ -27,8 +27,16 @@ interface DownloadRecord {
 const records: DownloadRecord[] = []; // oldest first
 // Tabs whose "Save as" dialog is open; a page can't stack dialogs. They count toward MAX_RUNNING.
 const pendingDialogs = new Set<WebContents>();
+// Items that were allowed to start and haven't finished (including ones waiting for the dialog),
+// with the page that started each. A record only exists once bytes arrive, so this is separate.
+const runningFrom = new Map<DownloadItem, WebContents>();
 const claimedPaths = new Set<string>(); // test-only: files of running downloads, lower-cased
 let nextId = 1;
+
+// Whether `contents` has a download running; its tab must not be put to sleep.
+export function hasRunningDownload(contents: WebContents): boolean {
+  return pendingDialogs.has(contents) || [...runningFrom.values()].includes(contents);
+}
 
 function findRecord(id: unknown): DownloadRecord | undefined {
   if (!Number.isInteger(id)) throw new Error('Bad download id');
@@ -105,6 +113,9 @@ export function initDownloads(
       if (!app.isPackaged) console.warn('Download blocked');
       return;
     }
+
+    runningFrom.set(item, contents);
+    item.once('done', () => runningFrom.delete(item));
 
     const pageUrl = contents.getURL();
     const downloadUrl = item.getURLChain().at(-1) ?? item.getURL();

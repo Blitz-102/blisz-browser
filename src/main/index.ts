@@ -15,7 +15,7 @@ import {
 } from 'electron';
 import { isWebUrl } from '../shared/url';
 import { runBench } from './bench';
-import { initDownloads } from './downloads';
+import { hasRunningDownload, initDownloads } from './downloads';
 import { addTrustedUi, handleFromUi, UI_URL } from './ipc';
 import { getMetrics } from './metrics';
 import { denyAllPermissions, installPermissionHandlers } from './permissions';
@@ -26,6 +26,7 @@ import {
   initTabs,
   isFullscreen,
   isPageContents,
+  mediaGranted,
   offerExternalLink,
   pageDecisions,
   pageUrl,
@@ -224,10 +225,10 @@ function createWindow(): WebContents {
   });
   addTrustedUi(uiView.webContents);
   window.contentView.addChildView(uiView);
-  const pageSession = initTabs(window, uiView.webContents);
+  const pageSession = initTabs(window, uiView.webContents, hasRunningDownload);
   installPermissionHandlers(
     pageSession,
-    { topUrl: pageUrl, isFullscreen, ask: askPrompt },
+    { topUrl: pageUrl, isFullscreen, ask: askPrompt, mediaGranted },
     pageDecisions,
   );
   initDownloads(uiView.webContents, pageSession, saveDownloadsWithoutPrompt);

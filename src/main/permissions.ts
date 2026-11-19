@@ -238,6 +238,8 @@ export interface PermissionHost {
   isFullscreen(contents: WebContents): boolean;
   // Shows the question in the tab and resolves with the answer; false if the tab navigates or closes first.
   ask(contents: WebContents, kind: PromptKind, origin: string): Promise<boolean>;
+  // Camera or microphone access was allowed, so the tab must not be put to sleep.
+  mediaGranted(contents: WebContents): void;
 }
 
 // Denies everything and shows no device chooser. Every new session starts like this; only the
@@ -287,9 +289,13 @@ export function installPermissionHandlers(
       callback(false); // not remembered
       return;
     }
+    const answer = (allow: boolean) => {
+      if (allow && permission === 'media') host.mediaGranted(contents);
+      callback(allow);
+    };
     const remembered = store.recall(verdict.origin, verdict.ask);
-    if (remembered !== undefined) callback(remembered);
-    else host.ask(contents, verdict.ask, verdict.origin).then(callback);
+    if (remembered !== undefined) answer(remembered);
+    else host.ask(contents, verdict.ask, verdict.origin).then(answer);
   });
 
   targetSession.setPermissionCheckHandler((contents, permission, requestingOrigin, details) => {

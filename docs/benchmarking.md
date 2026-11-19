@@ -24,7 +24,7 @@ Blisz:
 npm run bench:memory
 ```
 
-This builds the app, then runs it with `--bench`. It opens the sites, waits, prints the report and quits on its own.
+This builds the app, then runs it with `--bench`. It opens the sites, waits, prints the report, puts every background tab to sleep, waits 15 more seconds, prints the report again and quits on its own.
 
 Brave:
 
@@ -63,19 +63,22 @@ The sites are in `bench/sites.json`. Both browsers read this one file, so they o
 
 `settleSeconds` in the same file is how long both browsers wait after the sites are opened. It is 60 at the moment. It must be a whole number from 1 to 600.
 
-Change it only for every run in a comparison, and note the value in the perf log. Blisz stops with "Bench timed out" if the whole run takes longer than the settle time plus 60 seconds.
+Change it only for every run in a comparison, and note the value in the perf log. Blisz stops with "Bench timed out" if the whole run takes longer than the settle time plus 105 seconds.
 
 ## Reading the output
 
-Blisz prints:
+Blisz prints **`Tabs finished loading: X of N`** first, then the report below twice: once after the settle, and once headed "Memory after sleeping background tabs" (see Tab sleeping below). Each report has:
 
 1. **A table with one row per process.** The useful columns are:
    - `label`: "UI" for the sidebar, "Tab: <page title>" for a page, and the process type (for example GPU) for the rest.
    - `privateWorkingSetMB`: the comparable figure. A `-` means the PowerShell script did not report that process.
    - `privateMB`, `workingSetMB` and `cpuPercent`: Electron's own measures. Use them for diagnosis, not for comparison.
-2. **`Tabs finished loading: X of N`.** If X is less than N, some pages were still loading when the total was taken, so the run is not a fair reading. Rerun it or note it in the perf log.
-3. **`Total private`** and **`working set`**: Electron's totals. Not for comparison.
-4. **`Total private working set: X MB`**: the comparable total, and the number for the perf log.
+2. **`Total private`** and **`working set`**: Electron's totals. Not for comparison.
+3. **`Total private working set: X MB`**: the comparable total, and the number for the perf log.
+
+If X is less than N in `Tabs finished loading`, some pages were still loading when the first total was taken, so the run is not a fair reading. Rerun it or note it in the perf log.
+
+**Tab sleeping.** Only the first report (after the settle) is comparable with Brave: it is what the browser uses with every tab awake. The second shows what sleeping saves. It sleeps every background tab at once, whatever its idle time, except the ones that never sleep (playing audio, loading, camera or microphone in use, a download running, a question showing, or an open popup), and waits 15 seconds for their renderers to exit. The active tab stays awake. In normal use a tab sleeps after 30 minutes in the background, or 5 minutes when less than 1 GB of memory is free.
 
 Brave prints:
 

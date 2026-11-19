@@ -23,7 +23,7 @@ import {
 import type { TabsState } from '../src/shared/tabs';
 
 // Each launch gets a throwaway profile, so tests never touch (or depend on) the real one.
-async function launch(): Promise<ElectronApplication> {
+async function launch(extraEnv: Record<string, string> = {}): Promise<ElectronApplication> {
   const userData = mkdtempSync(join(tmpdir(), 'blisz-test-'));
   const app = await electron.launch({
     // Scale factor 1 so 1280x800 is exact; at 125% display scaling Windows rounds the height to 801.
@@ -34,6 +34,7 @@ async function launch(): Promise<ElectronApplication> {
       ELECTRON_RENDERER_URL: '',
       BLISZ_USER_DATA: userData,
       BLISZ_DOWNLOAD_NO_PROMPT: '1', // the native Save as dialog can't be driven by a test
+      ...extraEnv,
     },
   });
   app.on('close', () => rmSync(userData, { recursive: true, force: true, maxRetries: 5 }));
@@ -483,10 +484,10 @@ async function startFixture(): Promise<{ home: string; stop: () => void }> {
 
 // Starts the app on the fixture site with the home page open in the first tab. Popup tests each
 // get their own app because the rate limit remembers popups for 5 s.
-async function openFixtureSession() {
+async function openFixtureSession(env: Record<string, string> = {}) {
   const fixture = await startFixture();
   const { home } = fixture;
-  const app = await launch().catch((error) => {
+  const app = await launch(env).catch((error) => {
     fixture.stop();
     throw error;
   });
@@ -850,9 +851,9 @@ async function startDownloadFixture(): Promise<{
   };
 }
 
-async function openDownloadSession() {
+async function openDownloadSession(env: Record<string, string> = {}) {
   const fixture = await startDownloadFixture();
-  const app = await launch().catch((error) => {
+  const app = await launch(env).catch((error) => {
     fixture.stop();
     throw error;
   });
@@ -1595,8 +1596,8 @@ async function tabMenuSleep(
 
 // The fixture site plus a second site (localhost is not 127.0.0.1, so it gets its own renderer) with
 // a background tab that went through "text" and then "links". The first tab stays active.
-async function openSleepSession() {
-  const session = await openFixtureSession();
+async function openSleepSession(env: Record<string, string> = {}) {
+  const session = await openFixtureSession(env);
   const { ui, home, openerId, getState } = session;
   const site = home.replace('127.0.0.1', 'localhost');
   const tabId = await ui.evaluate<number>('window.bliss.createTab()');
@@ -1861,5 +1862,202 @@ test('a tab with an open popup cannot be put to sleep', async () => {
     expect(await tabMenuSleep(app, ui, openerId ?? 0)).toBe(true);
   } finally {
     await close();
+  }
+});
+
+// BLISZ_SLEEP_AFTER_MS is set only in the auto-sleep tests, so the sweep never touches the others.
+const SLEEP_AFTER_MS = '3000';
+const SLOW_SLEEP_AFTER_MS = '8000'; // setup must finish well inside this
+const SLEEP_WAIT = { timeout: 20_000 };
+
+test('an idle background tab falls asleep on its own and the active tab stays awake', async () => {
+  const { app, openerId, findTab, getState, close } = await openSleepSession({
+    BLISZ_SLEEP_AFTER_MS: SLOW_SLEEP_AFTER_MS,
+  });
+  try {
+    const pid = await app.evaluate(({ webContents }) =>
+      webContents
+        .getAllWebContents()
+        .find((contents) => contents.getTitle() === 'Fixture links')
+        ?.getOSProcessId(),
+    );
+    expect(pid).toBeDefined();
+    expect(pid).toBeGreaterThan(0);
+    await expect.poll(async () => (await findTab())?.sleeping, SLEEP_WAIT).toBe(true);
+    await expect
+      .poll(
+        () => app.evaluate(({ app }) => app.getAppMetrics().map((metric) => metric.pid)),
+        SLEEP_WAIT,
+      )
+      .not.toContain(pid);
+    const opener = (await getState()).tabs.find((tab) => tab.id === openerId);
+    expect(opener?.sleeping).toBe(false);
+    expect((await getState()).activeId).toBe(openerId);
+  } finally {
+    await close();
+  }
+});
+
+test('a background tab with a running download stays awake, then sleeps once it is done', async () => {
+  const { ui, home, release, pageAt, close } = await openDownloadSession({
+    BLISZ_SLEEP_AFTER_MS: SLEEP_AFTER_MS,
+  });
+  try {
+    const getState = () => ui.evaluate<TabsState>('window.bliss.getTabsState()');
+    const downloadTabId = (await getState()).activeId;
+    await pageAt(home).getByRole('link', { name: 'Report', exact: true }).click();
+    await expect(ui.getByRole('region', { name: 'Downloads' }).getByRole('listitem')).toHaveCount(
+      1,
+    );
+
+    // The download itself must be what keeps the tab awake, not a page still loading.
+    await expect
+      .poll(
+        async () =>
+          (await getState()).tabs.find((tab) => tab.id === downloadTabId)?.isLoading === false,
+      )
+      .toBe(true);
+
+    // An idle second tab shows the sweep is running; then a third tab takes the foreground.
+    const idleId = await ui.evaluate<number>('window.bliss.createTab()');
+    await ui.evaluate(`window.bliss.navigateTab(${idleId}, '${home}pic.png')`);
+    await expect
+      .poll(
+        async () => (await getState()).tabs.find((tab) => tab.id === idleId)?.isLoading === false,
+      )
+      .toBe(true);
+    await ui.evaluate('window.bliss.createTab()');
+    const isAsleep = async (id: number) =>
+      (await getState()).tabs.find((tab) => tab.id === id)?.sleeping;
+    await expect.poll(() => isAsleep(idleId), SLEEP_WAIT).toBe(true);
+    expect(await isAsleep(downloadTabId)).toBe(false);
+
+    release();
+    await expect(ui.getByRole('region', { name: 'Downloads' })).toContainText('Done');
+    await expect.poll(() => isAsleep(downloadTabId), SLEEP_WAIT).toBe(true);
+  } finally {
+    await close();
+  }
+});
+
+// Pages for the sleep tests that need their own server: a form that POSTs, a page whose
+// beforeunload handler vetoes leaving (unsaved changes), and a plain page.
+async function startSleepFixture() {
+  let posts = 0;
+  const server = createServer((request, response) => {
+    const path = request.url ?? '/';
+    response.setHeader('Content-Type', 'text/html');
+    response.setHeader('Cache-Control', 'no-store');
+    if (request.method === 'POST') {
+      posts++;
+      request.resume();
+      response.end('<title>Posted</title>Thanks');
+    } else if (path === '/form') {
+      response.end(
+        '<title>Form</title><form method="post" action="/submit"><button>Send</button></form>',
+      );
+    } else if (path === '/slowleave') {
+      // Leaving takes a long time, then the page agrees.
+      response.end(
+        "<title>Slow leave</title><script>addEventListener('beforeunload', () => { const end = Date.now() + 7000; while (Date.now() < end); })</script>",
+      );
+    } else if (path === '/unsaved') {
+      response.end(
+        "<title>Unsaved</title><script>addEventListener('beforeunload', (e) => { e.preventDefault(); e.returnValue = 'x'; })</script>",
+      );
+    } else {
+      response.end('<title>Plain</title>Plain page');
+    }
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return {
+    home: `http://127.0.0.1:${(server.address() as AddressInfo).port}/`,
+    posts: () => posts,
+    stop: () => {
+      server.closeAllConnections();
+      server.close();
+    },
+  };
+}
+
+test('a tab whose page vetoes leaving (unsaved changes) stays awake while a plain tab sleeps', async () => {
+  const fixture = await startSleepFixture();
+  const app = await launch({ BLISZ_SLEEP_AFTER_MS: SLEEP_AFTER_MS });
+  try {
+    const ui = await findUi(app);
+    const getState = () => ui.evaluate<TabsState>('window.bliss.getTabsState()');
+    const guardId = (await getState()).activeId;
+    await ui.evaluate(`window.bliss.navigateTab(${guardId}, '${fixture.home}unsaved')`);
+    await expect.poll(async () => (await getState()).tabs[0]?.title).toBe('Unsaved');
+    // No click is needed: Electron counts closing as user activation, so the handler is honoured.
+    const plainId = await ui.evaluate<number>('window.bliss.createTab()');
+    await ui.evaluate(`window.bliss.navigateTab(${plainId}, '${fixture.home}plain')`);
+    await expect
+      .poll(async () => (await getState()).tabs.map((tab) => tab.title))
+      .toEqual(['Unsaved', 'Plain']);
+    const activeId = await ui.evaluate<number>('window.bliss.createTab()');
+    const sleeping = async (id: number) =>
+      (await getState()).tabs.find((tab) => tab.id === id)?.sleeping;
+
+    await expect.poll(() => sleeping(plainId), SLEEP_WAIT).toBe(true);
+    // Several more sweeps: the guarded tab is asked each time and keeps saying no.
+    await ui.waitForTimeout(5000);
+    expect(await sleeping(guardId)).toBe(false);
+    expect((await getState()).tabs.find((tab) => tab.id === guardId)?.title).toBe('Unsaved');
+    expect((await getState()).activeId).toBe(activeId);
+  } finally {
+    await app.close();
+    fixture.stop();
+  }
+});
+
+test('a page that is slow to answer beforeunload still goes to sleep, not closed', async () => {
+  const fixture = await startSleepFixture();
+  const app = await launch({ BLISZ_SLEEP_AFTER_MS: SLEEP_AFTER_MS });
+  try {
+    const ui = await findUi(app);
+    const getState = () => ui.evaluate<TabsState>('window.bliss.getTabsState()');
+    const slowId = (await getState()).activeId;
+    await ui.evaluate(`window.bliss.navigateTab(${slowId}, '${fixture.home}slowleave')`);
+    await expect.poll(async () => (await getState()).tabs[0]?.title).toBe('Slow leave');
+    await ui.evaluate('window.bliss.createTab()');
+    const findTab = async () => (await getState()).tabs.find((tab) => tab.id === slowId);
+    // The slow answer must finish the sleep, not close the tab like a page's window.close().
+    await expect.poll(async () => (await findTab())?.sleeping, { timeout: 30_000 }).toBe(true);
+    expect((await getState()).order).toContain(slowId);
+  } finally {
+    await app.close();
+    fixture.stop();
+  }
+});
+
+test('a tab that came from a form POST wakes without sending the POST again', async () => {
+  const fixture = await startSleepFixture();
+  const app = await launch({ BLISZ_SLEEP_AFTER_MS: SLEEP_AFTER_MS });
+  try {
+    const ui = await findUi(app);
+    const getState = () => ui.evaluate<TabsState>('window.bliss.getTabsState()');
+    const tabId = (await getState()).activeId;
+    const findTab = async () => (await getState()).tabs.find((tab) => tab.id === tabId);
+    await ui.evaluate(`window.bliss.navigateTab(${tabId}, '${fixture.home}form')`);
+    await expect.poll(async () => (await findTab())?.title).toBe('Form');
+    await app
+      .windows()
+      .find((window) => window.url() === `${fixture.home}form`)
+      ?.getByRole('button', { name: 'Send' })
+      .click();
+    await expect.poll(async () => (await findTab())?.title).toBe('Posted');
+    expect(fixture.posts()).toBe(1);
+
+    await ui.evaluate('window.bliss.createTab()');
+    await expect.poll(async () => (await findTab())?.sleeping, SLEEP_WAIT).toBe(true);
+    await ui.evaluate(`window.bliss.activateTab(${tabId})`);
+    await expect.poll(async () => (await findTab())?.sleeping).toBe(false);
+    await expect.poll(async () => (await findTab())?.isLoading).toBe(false);
+    await ui.waitForTimeout(1000);
+    expect(fixture.posts()).toBe(1);
+  } finally {
+    await app.close();
+    fixture.stop();
   }
 });

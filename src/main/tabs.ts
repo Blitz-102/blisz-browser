@@ -31,6 +31,7 @@ import { fetchFavicon, webFaviconUrls } from './favicon';
 import { handleFromUi } from './ipc';
 import { DecisionStore, isExternalKind, PromptQueue, parseExternalLink } from './permissions';
 import { matchShortcut, type ShortcutAction } from './shortcuts';
+import { shouldAutoSleep, sleepLimitMs } from './sleep';
 
 // The one place the page session is named. The UI view uses the default session, which is the
 // only one that serves blisz://, so web pages can't reach app files.
@@ -95,6 +96,15 @@ const ZOOM_STEPS = [
   0.25, 0.33, 0.5, 0.67, 0.75, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4, 5,
 ];
 const ZOOM_EPSILON = 0.01;
+// Background tabs that have been idle long enough fall asleep (see sleep.ts for the limits).
+const SLEEP_SWEEP_MS = 60_000;
+const MIN_SLEEP_OVERRIDE_MS = 1000; // keeps the sweep interval at 500 ms or more
+// Development only: BLISZ_SLEEP_AFTER_MS replaces the idle limit so tests don't wait 30 minutes.
+const devSleepLimitMs = !app.isPackaged ? Number(process.env.BLISZ_SLEEP_AFTER_MS) : Number.NaN;
+const sleepLimitOverride =
+  Number.isInteger(devSleepLimitMs) && devSleepLimitMs >= MIN_SLEEP_OVERRIDE_MS
+    ? devSleepLimitMs
+    : null;
 
 interface Tab {
   id: number;
@@ -123,6 +133,10 @@ interface Tab {
   // sleepState with error 'crashed' (Reload rebuilds the view); one that fails to load clears it and
   // shows the error card.
   sleepState: { entries: NavigationEntry[]; index: number } | null;
+  lastActiveAt: number; // when the tab was created, left the foreground or stopped playing audio
+  mediaInUse: boolean; // camera or microphone was allowed for the current page
+  // Set while a beforeunload-checked close of ours is in flight for this view; saved is what the tab keeps if the page agrees.
+  sleepRequest: { view: WebContentsView; saved: NonNullable<Tab['sleepState']> } | null;
 }
 
 // The page area as distances from the window edges, so a window resize can be applied at once.
@@ -158,7 +172,14 @@ let focusOnAttach = false; // set by a navigation; layout() focuses the page onc
 let findOpen = false; // the UI's find strip is showing for the active tab
 let findText = ''; // the last query, for F3 and Ctrl+G
 let window: BaseWindow;
+let hasRunningDownload: (contents: WebContents) => boolean; // from downloads.ts, passed in to avoid an import cycle
 let ui: WebContents;
+
+// Called when camera or microphone access is allowed: such a tab is never put to sleep.
+export function mediaGranted(contents: WebContents): void {
+  const tab = findPageTab(contents);
+  if (tab) tab.mediaInUse = true;
+}
 
 export function isPageContents(contents: WebContents): boolean {
   return pageContents.has(contents);
@@ -577,6 +598,9 @@ function setPageArea(area: PageArea): void {
 function watchPageEvents(tab: Tab, view: WebContentsView): void {
   const contents = view.webContents;
   const onChange = () => queueUpdate(tab.id);
+  contents.on('audio-state-changed', (event) => {
+    if (tab.view === view && !event.audible) tab.lastActiveAt = Date.now();
+  });
   contents.on('did-start-loading', onChange);
   contents.on('did-stop-loading', onChange);
   // A new page load drops the old error.
@@ -604,6 +628,7 @@ function watchPageEvents(tab: Tab, view: WebContentsView): void {
   });
   contents.on('render-process-gone', (_event, details) => {
     if (tab.view !== view || details.reason === 'clean-exit') return;
+    tab.sleepRequest = null; // no beforeunload answer will come
     tab.prompts.cancelAll();
     dropHtmlFullscreen(tab);
     setError(tab, { kind: 'crashed' });
@@ -618,6 +643,7 @@ function watchPageEvents(tab: Tab, view: WebContentsView): void {
       setError(tab, { kind: 'network', code: -301, description: 'ERR_DISALLOWED_URL_SCHEME', url });
       return;
     }
+    refreshSleepRequest(tab, view);
     tab.prompts.cancelAll(); // questions belong to the page that asked
     setError(tab, null);
     // A woken tab keeps the favicon it slept with; page-favicon-updated refreshes it.
@@ -627,12 +653,17 @@ function watchPageEvents(tab: Tab, view: WebContentsView): void {
     tab.blockedPopups = 0;
     tab.blockedDownloads = 0;
     tab.committed = true;
+    tab.mediaInUse = false;
     tab.lastInputAt = 0; // a click on the old page doesn't count for the new one
     tab.recentDownloads = [];
     if (tab.id === activeId) closeFind();
     onChange();
   });
-  contents.on('did-navigate-in-page', () => tab.view === view && onChange());
+  contents.on('did-navigate-in-page', () => {
+    if (tab.view !== view) return;
+    refreshSleepRequest(tab, view);
+    onChange();
+  });
   contents.on('page-title-updated', () => tab.view === view && onChange());
   contents.on('enter-html-full-screen', () => {
     if (tab.view !== view) return;
@@ -676,6 +707,16 @@ function watchPageEvents(tab: Tab, view: WebContentsView): void {
   contents.once('destroyed', () => {
     // closeTab or a closing window got here first, or the tab went to sleep and has no view.
     if (window.isDestroyed() || !tabs.includes(tab) || tab.view !== view) return;
+    // The page agreed to leave in auto-sleep's beforeunload check: finish the sleep. If the tab was
+    // activated, or a popup or download started, during the check, it sleeps or wakes anyway (accepted).
+    if (tab.sleepRequest?.view === view) {
+      // The view's webContents is already gone, so sleepTab must not close it.
+      if (attachedView === view) detachView();
+      tab.view = null;
+      sleepTab(tab, tab.sleepRequest.saved);
+      if (tab.id === activeId) activateTab(tab);
+      return;
+    }
     // The view's webContents is gone, so closeTab must not touch it.
     if (attachedView === tab.view) detachView();
     tab.view = null;
@@ -765,6 +806,10 @@ function navigate(tab: Tab, input: string): boolean {
     return false;
   }
   tab.sleepState = null; // the user is going elsewhere; there is nothing left to restore
+  if (tab.sleepRequest) {
+    tab.sleepRequest = null;
+    discardView(tab); // the page is already closing; the new page gets a fresh view
+  }
   if (!tab.view) attachPage(tab, createView());
   // Failures are reported through did-fail-load (error pages come in a later step).
   tab.view?.webContents.loadURL(new URL(target).href).catch(() => {});
@@ -796,6 +841,9 @@ function addTab(index: number): Tab {
     isPopup: false,
     committed: false,
     sleepState: null,
+    lastActiveAt: Date.now(),
+    mediaInUse: false,
+    sleepRequest: null,
   };
   tabs.splice(index, 0, tab);
   queueUpdate(tab.id); // sends the new tab's full info
@@ -808,7 +856,10 @@ function activateTab(tab: Tab): void {
   if (tab.id !== activeId) {
     closeFind();
     const previous = findTab(activeId);
-    if (previous) exitHtmlFullscreen(previous);
+    if (previous) {
+      exitHtmlFullscreen(previous);
+      previous.lastActiveAt = Date.now();
+    }
   }
   activeId = tab.id;
   queueStructureUpdate();
@@ -852,9 +903,9 @@ function historyToSave(tab: Tab): NonNullable<Tab['sleepState']> | null {
 }
 
 // Destroys the page view, which frees its renderer, and keeps what the sidebar and wakeTab need.
-function sleepTab(tab: Tab): void {
-  const saved = historyToSave(tab);
+function sleepTab(tab: Tab, saved = historyToSave(tab)): void {
   if (!saved) return;
+  tab.sleepRequest = null;
   tab.sleepState = saved;
   tab.faviconFetch?.abort();
   tab.faviconFetch = null;
@@ -870,8 +921,69 @@ function sleepTab(tab: Tab): void {
   tab.recentDownloads = [];
   tab.lastInputAt = 0;
   tab.openedAt = 0;
+  tab.mediaInUse = false;
   discardView(tab);
   queueUpdate(tab.id);
+}
+
+// Puts to sleep every background tab that has been idle for `limitMs` and is not busy with audio,
+// camera, a download, a load, a question or a popup. sleepTab still applies its own checks.
+function sleepIdleTabs(limitMs: number): void {
+  const now = Date.now();
+  for (const tab of [...tabs]) {
+    const contents = tab.view?.webContents;
+    if (!contents || contents.isDestroyed()) continue;
+    const idle = shouldAutoSleep(
+      {
+        isActive: tab.id === activeId,
+        asleepOrRestoring: tab.sleepState !== null,
+        audible: contents.isCurrentlyAudible(),
+        mediaInUse: tab.mediaInUse,
+        downloading: hasRunningDownload(contents),
+        loading: contents.isLoading(),
+        devToolsOpen: contents.isDevToolsOpened(),
+        hasPrompt: tab.prompts.current !== null,
+        hasOpenPopup: tabs.some((other) => other.opener === tab),
+        lastActiveAt: tab.lastActiveAt,
+      },
+      now,
+      limitMs,
+    );
+    // A crashed tab is eligible on purpose: sleeping it frees the dead view and wakes it with a fresh renderer.
+    if (idle) autoSleepTab(tab);
+  }
+}
+
+// Unlike the menu's Sleep tab, auto-sleep first gives the page its beforeunload: a page with unsaved
+// changes vetoes, and then it just stays awake and its idle clock restarts. The tab is left as it
+// is until the page agrees (the 'destroyed' handler finishes the sleep). No dialog is shown, and
+// the veto is never overridden (no preventDefault on will-prevent-unload).
+function autoSleepTab(tab: Tab): void {
+  const saved = historyToSave(tab);
+  const view = tab.view;
+  // A request that is still open (a slow or hung page) is never repeated.
+  if (!saved || !view || tab.sleepRequest) return;
+  tab.sleepRequest = { view, saved };
+  // Without preventDefault here Electron treats the event as a veto and shows no dialog.
+  view.webContents.once('will-prevent-unload', () => {
+    if (tab.sleepRequest?.view !== view) return;
+    tab.sleepRequest = null;
+    tab.lastActiveAt = Date.now();
+  });
+  view.webContents.close({ waitForBeforeUnload: true });
+}
+
+// The close can't be aborted once the page agrees, so a page that navigated meanwhile still sleeps,
+// but with its current history.
+function refreshSleepRequest(tab: Tab, view: WebContentsView): void {
+  if (tab.sleepRequest?.view !== view) return;
+  const saved = historyToSave(tab);
+  if (saved) tab.sleepRequest.saved = saved;
+}
+
+// Benchmark only (src/main/bench.ts): sleeps every background tab that could sleep, however recently used.
+export function sleepBackgroundTabs(): void {
+  sleepIdleTabs(0);
 }
 
 // Closes the page view. tab.view is cleared first so the old contents' late events are ignored.
@@ -1150,8 +1262,13 @@ function isPageArea(value: unknown): value is PageArea {
 
 // Creates the first (blank) tab and registers the tab IPC for the given window. Single window
 // only: module state is shared and the IPC handlers are registered once.
-export function initTabs(appWindow: BaseWindow, uiContents: WebContents): Electron.Session {
+export function initTabs(
+  appWindow: BaseWindow,
+  uiContents: WebContents,
+  isDownloading: (contents: WebContents) => boolean,
+): Electron.Session {
   window = appWindow;
+  hasRunningDownload = isDownloading;
   ui = uiContents;
   createTab();
 
@@ -1244,9 +1361,17 @@ export function initTabs(appWindow: BaseWindow, uiContents: WebContents): Electr
   window.on('leave-full-screen', () => {
     userFullscreen = false;
   });
+  // Every minute; with the dev override, twice per override period so a test sees the sleep soon.
+  const sleepSweep = setInterval(
+    () => {
+      sleepIdleTabs(sleepLimitOverride ?? sleepLimitMs(process.getSystemMemoryInfo().free));
+    },
+    sleepLimitOverride ? Math.min(SLEEP_SWEEP_MS, sleepLimitOverride / 2) : SLEEP_SWEEP_MS,
+  );
   // WebContentsView contents are not destroyed with the window.
   window.on('closed', () => {
     clearTimeout(flushTimer);
+    clearInterval(sleepSweep);
     for (const tab of tabs) {
       tab.prompts.cancelAll();
       if (tab.view && !tab.view.webContents.isDestroyed()) tab.view.webContents.close();

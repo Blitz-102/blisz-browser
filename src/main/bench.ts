@@ -5,10 +5,11 @@ import { promisify } from 'node:util';
 import { app, type WebContents } from 'electron';
 import { type MeasuredProcess, mergeByPid, parseBenchConfig } from '../shared/bench';
 import { getMetrics } from './metrics';
-import { countLoadedTabs, getTabProcessLabels, openBenchTabs } from './tabs';
+import { countLoadedTabs, getTabProcessLabels, openBenchTabs, sleepBackgroundTabs } from './tabs';
 
-const SAFETY_MARGIN_MS = 60_000;
+const SAFETY_MARGIN_MS = 90_000;
 const SCRIPT_TIMEOUT_MS = 30_000;
+const SLEEP_SETTLE_MS = 15_000; // time for the renderers of sleeping tabs to exit
 const toMB = (kb: number) => (kb / 1024).toFixed(1);
 const run = promisify(execFile);
 
@@ -62,7 +63,7 @@ export function runBench(ui: WebContents): void {
     return;
   }
 
-  setTimeout(() => fail('Bench timed out'), settleMs + SAFETY_MARGIN_MS).unref();
+  setTimeout(() => fail('Bench timed out'), settleMs + SLEEP_SETTLE_MS + SAFETY_MARGIN_MS).unref();
   ui.once('did-fail-load', (_event, _code, description) =>
     fail(`UI failed to load: ${description}`),
   );
@@ -71,7 +72,7 @@ export function runBench(ui: WebContents): void {
     // CPU % is measured since the previous call, so this resets it to cover the settle window.
     app.getAppMetrics();
     setTimeout(() => {
-      report(ui, urls.length, settleMs)
+      measureBoth(ui, urls.length, settleMs)
         .catch((error) => {
           process.exitCode = 1;
           console.error('Bench failed', error);
@@ -81,7 +82,15 @@ export function runBench(ui: WebContents): void {
   });
 }
 
-async function report(ui: WebContents, tabCount: number, settleMs: number): Promise<void> {
+async function measureBoth(ui: WebContents, tabCount: number, settleMs: number): Promise<void> {
+  console.log(`Tabs finished loading: ${countLoadedTabs()} of ${tabCount}`);
+  await report(ui, `Memory after ${settleMs / 1000}s settle (MB)`);
+  sleepBackgroundTabs();
+  await new Promise((resolve) => setTimeout(resolve, SLEEP_SETTLE_MS));
+  await report(ui, `Memory after sleeping background tabs, ${SLEEP_SETTLE_MS / 1000}s later (MB)`);
+}
+
+async function report(ui: WebContents, heading: string): Promise<void> {
   const { processes, totalPrivateKB, totalWorkingSetKB } = getMetrics(
     ui.getOSProcessId(),
     getTabProcessLabels(),
@@ -94,7 +103,7 @@ async function report(ui: WebContents, tabCount: number, settleMs: number): Prom
   }
   const rows = mergeByPid(processes, measured?.processes ?? []);
 
-  console.log(`Memory after ${settleMs / 1000}s settle (MB)`);
+  console.log(heading);
   console.table(
     rows.map((p) => ({
       pid: p.pid,
@@ -106,7 +115,6 @@ async function report(ui: WebContents, tabCount: number, settleMs: number): Prom
       cpuPercent: p.cpuPercent.toFixed(1),
     })),
   );
-  console.log(`Tabs finished loading: ${countLoadedTabs()} of ${tabCount}`);
   console.log(
     `Total private: ${toMB(totalPrivateKB)} MB, working set: ${toMB(totalWorkingSetKB)} MB`,
   );
