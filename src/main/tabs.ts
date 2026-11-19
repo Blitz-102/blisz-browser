@@ -102,6 +102,7 @@ const SLEEP_SWEEP_MS = 60_000;
 const MIN_SLEEP_OVERRIDE_MS = 1000; // keeps the sweep interval at 500 ms or more
 // The session is saved at most this often while tabs change, and again when the window closes.
 const SAVE_DELAY_MS = 2000;
+const MAX_CLOSED_TABS = 25;
 // Development only: BLISZ_SLEEP_AFTER_MS replaces the idle limit so tests don't wait 30 minutes.
 const devSleepLimitMs = !app.isPackaged ? Number(process.env.BLISZ_SLEEP_AFTER_MS) : Number.NaN;
 const sleepLimitOverride =
@@ -162,6 +163,13 @@ let promptReadyAt = 0; // clicks on a prompt count after this time
 let userFullscreen = false; // the user made the window fullscreen with F11
 
 const tabs: Tab[] = []; // sidebar order
+// Closed web tabs for Ctrl+Shift+T, newest last. Memory only: pageState can hold form data, so this
+// is never saved or logged.
+const closedTabs: {
+  saved: NonNullable<Tab['sleepState']>;
+  favicon: string | null;
+  position: number;
+}[] = [];
 const pageContents = new WeakSet<WebContents>();
 const lastSent = new Map<number, TabInfo>();
 const dirty = new Set<number>();
@@ -1078,8 +1086,17 @@ function duplicateTab(source: Tab): Tab {
   return tab;
 }
 
+// Window shutdown never reaches closeTab, and a page's own window.close() leaves no view to read,
+// so neither is remembered.
 function closeTab(tab: Tab): void {
   const index = tabs.indexOf(tab);
+  const contents = tab.view?.webContents;
+  const saved =
+    tab.sleepState ?? (contents && !contents.isDestroyed() ? webHistory(contents) : null);
+  if (saved) {
+    closedTabs.push({ saved, favicon: tab.favicon, position: index });
+    if (closedTabs.length > MAX_CLOSED_TABS) closedTabs.shift();
+  }
   tabs.splice(index, 1);
   lastSent.delete(tab.id);
   queueStructureUpdate();
@@ -1096,6 +1113,17 @@ function closeTab(tab: Tab): void {
   const neighbour = opener ?? tabs[index] ?? tabs[index - 1];
   if (neighbour) activateTab(neighbour);
   else createTab(); // closing the last tab leaves a blank one
+}
+
+// Opens the most recently closed tab again, in its old position, through the same path as a wake.
+// After the last tab was closed, the blank tab that replaced it stays and the old tab goes before it.
+function reopenClosedTab(): void {
+  const closed = closedTabs.pop();
+  if (!closed) return;
+  const tab = addTab(Math.min(closed.position, tabs.length));
+  tab.sleepState = closed.saved;
+  tab.favicon = closed.favicon;
+  activateTab(tab);
 }
 
 // Benchmark only (src/main/bench.ts): loads every URL as a tab, the first in the blank tab that
@@ -1198,6 +1226,9 @@ function runShortcut(action: ShortcutAction): void {
       break;
     case 'close-tab':
       if (active) closeTab(active);
+      break;
+    case 'reopen-closed-tab':
+      reopenClosedTab();
       break;
     case 'next-tab':
       switchTab(1);

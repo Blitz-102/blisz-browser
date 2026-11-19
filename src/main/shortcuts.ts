@@ -2,6 +2,7 @@
 export type ShortcutAction =
   | 'new-tab'
   | 'close-tab'
+  | 'reopen-closed-tab'
   | 'next-tab'
   | 'previous-tab'
   | 'last-tab'
@@ -60,6 +61,7 @@ export function matchShortcut(input: ShortcutInput): ShortcutAction | null {
       if (letter === 'r') return 'reload-ignoring-cache';
       if (letter === 'i') return 'toggle-devtools';
       if (letter === 'g') return 'find-previous';
+      if (letter === 't') return 'reopen-closed-tab';
       return null;
     }
     // Digits match the physical key so they also work on layouts where the digit row needs Shift.

@@ -88,9 +88,13 @@ describe('matchShortcut', () => {
   });
 
   it('does not confuse plain Ctrl with Ctrl+Shift or Ctrl+Alt (AltGr)', () => {
-    expect(matchShortcut(press('T', { control: true, shift: true }))).toBeNull();
     expect(matchShortcut(press('t', { control: true, alt: true }))).toBeNull();
     expect(matchShortcut(press('t'))).toBeNull();
+  });
+
+  it('reopens the last closed tab on Ctrl+Shift+T', () => {
+    expect(matchShortcut(press('T', { control: true, shift: true }))).toBe('reopen-closed-tab');
+    expect(matchShortcut(press('t', { control: true }))).toBe('new-tab');
   });
 
   it('finds in the page', () => {

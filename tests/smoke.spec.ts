@@ -2240,3 +2240,198 @@ test('session restore: a tab whose page fails to load keeps its saved history', 
     removeProfile(profile);
   }
 });
+
+// A restoring tab reports its saved history but ignores Back until the page has committed, so keep
+// pressing Back until it works. The history has two entries, so a repeat press changes nothing.
+async function goBackWhenRestored(ui: Page, id: number, url: string) {
+  await expect
+    .poll(async () => {
+      await ui.evaluate(`window.bliss.tabGo(${id}, 'back')`);
+      return (await tabsOf(ui)).tabs.find((tab) => tab.id === id)?.url;
+    })
+    .toBe(url);
+}
+
+// One app on the counting server, with the shared helpers the reopen tests need.
+async function openReopenSession() {
+  const site = await startCountingServer();
+  const app = await launch().catch((error) => {
+    site.close();
+    throw error;
+  });
+  const ui = await findUi(app);
+  const close = async () => {
+    await app.close();
+    site.close();
+  };
+  // Opens a tab on `path` and waits for its title; returns its id.
+  const openPage = async (path: string) => {
+    const id = await ui.evaluate<number>('window.bliss.createTab()');
+    await ui.evaluate(`window.bliss.navigateTab(${id}, '${site.base}/${path}')`);
+    await expect
+      .poll(async () => (await tabsOf(ui)).tabs.find((tab) => tab.id === id)?.title)
+      .toBe(`Fixture ${path}`);
+    return id;
+  };
+  const reopen = (target: string) => pressKey(app, target, 'T', ['control', 'shift']);
+  return { app, ui, site, openPage, reopen, close };
+}
+
+test('Ctrl+Shift+T reopens a closed tab in its place, active, with its history', async () => {
+  const { ui, site, openPage, reopen, close } = await openReopenSession();
+  try {
+    const id = await openPage('a');
+    await ui.evaluate(`window.bliss.navigateTab(${id}, '${site.base}/b')`);
+    await expect
+      .poll(async () => (await tabsOf(ui)).tabs.find((tab) => tab.id === id)?.title)
+      .toBe('Fixture b');
+    const lastId = await openPage('c');
+    expect((await tabsOf(ui)).order.indexOf(id)).toBe(1);
+
+    await ui.evaluate(`window.bliss.closeTab(${id})`);
+    await expect.poll(async () => (await tabsOf(ui)).order.length).toBe(2);
+
+    // From the page that has focus; the UI case is covered by the next test.
+    await reopen(`${site.base}/c`);
+    await expect.poll(async () => (await tabsOf(ui)).order.length).toBe(3);
+    const state = await tabsOf(ui);
+    const reopened = state.order[1] as number;
+    expect(state.order[2]).toBe(lastId);
+    expect(state.activeId).toBe(reopened);
+    await expect
+      .poll(async () => (await tabsOf(ui)).tabs.find((tab) => tab.id === reopened)?.url)
+      .toBe(`${site.base}/b`);
+
+    await goBackWhenRestored(ui, reopened, `${site.base}/a`);
+  } finally {
+    await close();
+  }
+});
+
+test('Ctrl+Shift+T reopens tabs newest first, from the UI too', async () => {
+  const { ui, site, openPage, reopen, close } = await openReopenSession();
+  try {
+    const first = await openPage('a');
+    const second = await openPage('b');
+    await openPage('c'); // stays open, so closing the others leaves the window as it was
+    await ui.evaluate(`window.bliss.closeTab(${first})`);
+    await ui.evaluate(`window.bliss.closeTab(${second})`);
+    await expect.poll(async () => (await tabsOf(ui)).order.length).toBe(2);
+
+    const urls = async () => (await tabsOf(ui)).tabs.map((tab) => tab.url);
+    const activeUrl = async () => {
+      const state = await tabsOf(ui);
+      return state.tabs.find((tab) => tab.id === state.activeId)?.url;
+    };
+    await reopen('blisz://');
+    await expect.poll(activeUrl).toBe(`${site.base}/b`);
+    await reopen('blisz://');
+    await expect.poll(activeUrl).toBe(`${site.base}/a`);
+    expect(await urls()).toEqual(['', `${site.base}/a`, `${site.base}/b`, `${site.base}/c`]);
+  } finally {
+    await close();
+  }
+});
+
+test('Ctrl+Shift+T does nothing with no closed tab, and a closed blank tab is not remembered', async () => {
+  const { ui, site, openPage, reopen, close } = await openReopenSession();
+  try {
+    await reopen('blisz://'); // nothing closed yet
+    const blankId = await ui.evaluate<number>('window.bliss.createTab()');
+    await ui.evaluate(`window.bliss.closeTab(${blankId})`);
+    await reopen('blisz://');
+
+    // The shortcut is handled in main in order, so the next reopen brings back exactly this page.
+    const pageId = await openPage('a');
+    await ui.evaluate(`window.bliss.closeTab(${pageId})`);
+    await reopen('blisz://');
+    await expect
+      .poll(async () => (await tabsOf(ui)).tabs.map((tab) => tab.url))
+      .toEqual(['', `${site.base}/a`]);
+  } finally {
+    await close();
+  }
+});
+
+test('Ctrl+Shift+T reopens a closed sleeping tab with its history', async () => {
+  const { app, ui, site, openPage, reopen, close } = await openReopenSession();
+  try {
+    const id = await openPage('a');
+    await ui.evaluate(`window.bliss.navigateTab(${id}, '${site.base}/b')`);
+    await expect
+      .poll(async () => (await tabsOf(ui)).tabs.find((tab) => tab.id === id)?.title)
+      .toBe('Fixture b');
+    await openPage('c'); // the active tab can't sleep
+    await tabMenuSleep(app, ui, id, true);
+    await expect
+      .poll(async () => (await tabsOf(ui)).tabs.find((tab) => tab.id === id)?.sleeping)
+      .toBe(true);
+    await ui.evaluate(`window.bliss.closeTab(${id})`);
+    await expect.poll(async () => (await tabsOf(ui)).order.length).toBe(2);
+
+    await reopen('blisz://');
+    await expect.poll(async () => (await tabsOf(ui)).order.length).toBe(3);
+    const state = await tabsOf(ui);
+    const reopened = state.order[1] as number;
+    expect(state.activeId).toBe(reopened); // reopening wakes it
+    await expect
+      .poll(async () => (await tabsOf(ui)).tabs.find((tab) => tab.id === reopened)?.url)
+      .toBe(`${site.base}/b`);
+    await goBackWhenRestored(ui, reopened, `${site.base}/a`);
+  } finally {
+    await close();
+  }
+});
+
+test('Ctrl+Shift+T reopens a closed active tab as the active one, in its place', async () => {
+  const { ui, site, openPage, reopen, close } = await openReopenSession();
+  try {
+    await openPage('a');
+    const middle = await openPage('b');
+    await openPage('c');
+    await ui.evaluate(`window.bliss.activateTab(${middle})`);
+    await expect.poll(async () => (await tabsOf(ui)).activeId).toBe(middle);
+
+    await ui.evaluate(`window.bliss.closeTab(${middle})`);
+    await expect.poll(async () => (await tabsOf(ui)).order.length).toBe(3);
+    expect((await tabsOf(ui)).activeId).not.toBe(middle); // a neighbour took over
+
+    await reopen('blisz://');
+    await expect.poll(async () => (await tabsOf(ui)).order.length).toBe(4);
+    const state = await tabsOf(ui);
+    expect(state.order.map((id) => state.tabs.find((tab) => tab.id === id)?.url)).toEqual([
+      '',
+      `${site.base}/a`,
+      `${site.base}/b`,
+      `${site.base}/c`,
+    ]);
+    expect(state.activeId).toBe(state.order[2]);
+  } finally {
+    await close();
+  }
+});
+
+test('Ctrl+Shift+T remembers at most 25 closed tabs', async () => {
+  test.setTimeout(120_000);
+  const { ui, site, openPage, reopen, close } = await openReopenSession();
+  try {
+    // Pages p0 to p25 are opened and closed in turn; the blank first tab stays, so none is replaced.
+    for (let i = 0; i < 26; i++) {
+      const id = await openPage(`p${i}`);
+      await ui.evaluate(`window.bliss.closeTab(${id})`);
+      await expect.poll(async () => (await tabsOf(ui)).order.length).toBe(1);
+    }
+    for (let i = 0; i < 26; i++) await reopen('blisz://');
+    // The 26th press does nothing, so a page closed and reopened after it is the one that returns.
+    const lastId = await openPage('last');
+    await ui.evaluate(`window.bliss.closeTab(${lastId})`);
+    await reopen('blisz://');
+    await expect.poll(async () => (await tabsOf(ui)).order.length).toBe(27);
+    const urls = (await tabsOf(ui)).tabs.map((tab) => tab.url);
+    expect(urls).toContain(`${site.base}/last`);
+    expect(urls).toContain(`${site.base}/p1`);
+    expect(urls).not.toContain(`${site.base}/p0`);
+  } finally {
+    await close();
+  }
+});
