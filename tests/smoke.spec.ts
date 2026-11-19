@@ -12,6 +12,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import {
   type ElectronApplication,
   _electron as electron,
@@ -22,9 +23,13 @@ import {
 } from '@playwright/test';
 import type { TabsState } from '../src/shared/tabs';
 
-// Each launch gets a throwaway profile, so tests never touch (or depend on) the real one.
-async function launch(extraEnv: Record<string, string> = {}): Promise<ElectronApplication> {
-  const userData = mkdtempSync(join(tmpdir(), 'blisz-test-'));
+// Each launch gets a throwaway profile, so tests never touch (or depend on) the real one. A test
+// that relaunches passes its own `userData`, which it then has to delete itself.
+async function launch(
+  extraEnv: Record<string, string> = {},
+  ownedUserData?: string,
+): Promise<ElectronApplication> {
+  const userData = ownedUserData ?? mkdtempSync(join(tmpdir(), 'blisz-test-'));
   const app = await electron.launch({
     // Scale factor 1 so 1280x800 is exact; at 125% display scaling Windows rounds the height to 801.
     args: ['.', '--force-device-scale-factor=1'],
@@ -37,7 +42,9 @@ async function launch(extraEnv: Record<string, string> = {}): Promise<ElectronAp
       ...extraEnv,
     },
   });
-  app.on('close', () => rmSync(userData, { recursive: true, force: true, maxRetries: 5 }));
+  if (!ownedUserData) {
+    app.on('close', () => rmSync(userData, { recursive: true, force: true, maxRetries: 5 }));
+  }
   return app;
 }
 
@@ -2059,5 +2066,177 @@ test('a tab that came from a form POST wakes without sending the POST again', as
   } finally {
     await app.close();
     fixture.stop();
+  }
+});
+
+// A fixture site whose pages are titled "Fixture <path>", counting requests per path so a test can
+// tell whether a restored tab loaded its page.
+async function startCountingServer() {
+  const hits = new Map<string, number>();
+  const server = createServer((request, response) => {
+    const path = request.url ?? '/';
+    hits.set(path, (hits.get(path) ?? 0) + 1);
+    response.setHeader('Content-Type', 'text/html');
+    response.setHeader('Cache-Control', 'no-store'); // a restored page may otherwise come from the cache
+    response.end(`<title>Fixture ${path.slice(1)}</title><p>${path}</p>`);
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const close = () => {
+    server.closeAllConnections();
+    server.close();
+  };
+  return { base, hits, close };
+}
+
+// Resolves once the process has exited: close() can return while Chromium still holds the profile.
+async function stopApp(app: ElectronApplication, kill = false): Promise<void> {
+  const child = app.process();
+  const exited = new Promise((resolve) => child.once('exit', resolve));
+  if (kill) child.kill();
+  else await app.close();
+  if (child.exitCode === null && child.signalCode === null) await exited;
+}
+
+// Best effort, like launch(): on Windows Chromium's helpers can keep the profile locked until the
+// test worker exits, and a leftover temp folder must not fail a test.
+function removeProfile(profile: string): void {
+  try {
+    rmSync(profile, { recursive: true, force: true, maxRetries: 5 });
+  } catch {}
+}
+
+const tabsOf = (ui: Page) => ui.evaluate<TabsState>('window.bliss.getTabsState()');
+
+test('session restore: tabs come back in order, only the active one awake, history intact', async () => {
+  const profile = mkdtempSync(join(tmpdir(), 'blisz-restore-'));
+  const site = await startCountingServer();
+  let app: ElectronApplication | undefined;
+  try {
+    app = await launch({}, profile);
+    let ui = await findUi(app);
+    const firstId = (await tabsOf(ui)).activeId;
+    const secondId = await ui.evaluate<number>('window.bliss.createTab()');
+    await ui.evaluate<number>('window.bliss.createTab()'); // stays blank, so it is not saved
+    const titleOf = async (id: number) => (await tabsOf(ui)).tabs.find((t) => t.id === id)?.title;
+    for (const [id, path] of [
+      [firstId, 'a'],
+      [firstId, 'b'],
+      [secondId, 'c'],
+    ] as const) {
+      await ui.evaluate(`window.bliss.navigateTab(${id}, '${site.base}/${path}')`);
+      await expect.poll(() => titleOf(id)).toBe(`Fixture ${path}`);
+    }
+    await ui.evaluate(`window.bliss.activateTab(${firstId})`);
+    await stopApp(app); // closing the window saves the session
+
+    const cHitsBefore = site.hits.get('/c');
+    app = await launch({}, profile);
+    ui = await findUi(app);
+    await expect.poll(async () => (await tabsOf(ui)).tabs.length).toBe(2);
+    const state = await tabsOf(ui);
+    expect(state.tabs.map((tab) => tab.title)).toEqual(['Fixture b', 'Fixture c']);
+    expect(state.activeId).toBe(state.order[0]);
+    expect(state.tabs.map((tab) => tab.sleeping)).toEqual([false, true]);
+    const [first, second] = state.tabs;
+    // Only the UI and the one awake page exist.
+    expect(await app.evaluate(({ webContents }) => webContents.getAllWebContents().length)).toBe(2);
+    expect(site.hits.get('/c')).toBe(cHitsBefore);
+
+    // Once the first tab has committed its page, Back reaches the earlier entry.
+    await expect
+      .poll(async () => (await tabsOf(ui)).tabs.find((t) => t.id === first?.id)?.canGoBack)
+      .toBe(true);
+    await ui.evaluate(`window.bliss.tabGo(${first?.id}, 'back')`);
+    await expect
+      .poll(async () => (await tabsOf(ui)).tabs.find((t) => t.id === first?.id)?.url)
+      .toBe(`${site.base}/a`);
+
+    // Activating the sleeping tab loads it for the first time.
+    await ui.evaluate(`window.bliss.activateTab(${second?.id})`);
+    await expect.poll(() => site.hits.get('/c')).toBe((cHitsBefore ?? 0) + 1);
+    await stopApp(app);
+  } finally {
+    // Only matters when an assertion failed first; a closed app can't be asked for its process.
+    if (app) await stopApp(app, true).catch(() => {});
+    site.close();
+    removeProfile(profile);
+  }
+});
+
+test('session restore: a killed process restores the last throttled save', async () => {
+  const profile = mkdtempSync(join(tmpdir(), 'blisz-restore-'));
+  const site = await startCountingServer();
+  let app: ElectronApplication | undefined;
+  try {
+    app = await launch({}, profile);
+    let ui = await findUi(app);
+    const { activeId } = await tabsOf(ui);
+    await ui.evaluate(`window.bliss.navigateTab(${activeId}, '${site.base}/a')`);
+
+    // The save runs a couple of seconds after the change; read the file like another process would.
+    const savedUrls = () => {
+      try {
+        const db = new DatabaseSync(join(profile, 'blisz.db'), { readOnly: true });
+        try {
+          const rows = db.prepare('SELECT entries FROM session_tab').all();
+          return rows.map((row) => (JSON.parse(String(row.entries)) as { url: string }[])[0]?.url);
+        } finally {
+          db.close();
+        }
+      } catch {
+        return []; // not created yet, or locked for a moment
+      }
+    };
+    await expect.poll(savedUrls, { timeout: 15_000 }).toEqual([`${site.base}/a`]);
+
+    await stopApp(app, true);
+
+    app = await launch({}, profile);
+    ui = await findUi(app);
+    await expect
+      .poll(async () => (await tabsOf(ui)).tabs.map((tab) => tab.title))
+      .toEqual(['Fixture a']);
+    await stopApp(app);
+  } finally {
+    // Only matters when an assertion failed first; a closed app can't be asked for its process.
+    if (app) await stopApp(app, true).catch(() => {});
+    site.close();
+    removeProfile(profile);
+  }
+});
+
+test('session restore: a tab whose page fails to load keeps its saved history', async () => {
+  const profile = mkdtempSync(join(tmpdir(), 'blisz-restore-'));
+  const site = await startCountingServer();
+  let app: ElectronApplication | undefined;
+  try {
+    app = await launch({}, profile);
+    let ui = await findUi(app);
+    const { activeId } = await tabsOf(ui);
+    for (const path of ['a', 'b']) {
+      await ui.evaluate(`window.bliss.navigateTab(${activeId}, '${site.base}/${path}')`);
+      await expect.poll(async () => (await tabsOf(ui)).tabs[0]?.title).toBe(`Fixture ${path}`);
+    }
+    await stopApp(app);
+
+    site.close(); // the restored page now fails to load
+    app = await launch({}, profile);
+    ui = await findUi(app);
+    await expect.poll(async () => (await tabsOf(ui)).tabs[0]?.error?.kind).toBe('network');
+    await stopApp(app); // closing the window saves the session again
+
+    const db = new DatabaseSync(join(profile, 'blisz.db'), { readOnly: true });
+    try {
+      const rows = db.prepare('SELECT entries FROM session_tab').all();
+      expect(rows.map((row) => (JSON.parse(String(row.entries)) as unknown[]).length)).toEqual([2]);
+    } finally {
+      db.close();
+    }
+  } finally {
+    // Only matters when an assertion failed first; a closed app can't be asked for its process.
+    if (app) await stopApp(app, true).catch(() => {});
+    site.close();
+    removeProfile(profile);
   }
 });

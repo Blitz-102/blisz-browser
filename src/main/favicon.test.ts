@@ -1,6 +1,6 @@
 import type { Session } from 'electron';
 import { describe, expect, it } from 'vitest';
-import { fetchFavicon, isValidFavicon, webFaviconUrls } from './favicon';
+import { faviconFromDataUrl, fetchFavicon, isValidFavicon, webFaviconUrls } from './favicon';
 
 const png = (width: number, height: number) => {
   const bytes = new Uint8Array(24);
@@ -92,5 +92,52 @@ describe('fetchFavicon', () => {
     });
     const urls = ['https://a.test/a.svg', 'https://a.test/big.png'];
     expect(await fetchFavicon(pageSession, urls, signal)).toMatch(/^data:image\/svg\+xml;base64,/);
+  });
+});
+
+describe('faviconFromDataUrl', () => {
+  const dataUrl = (type: string, bytes: Uint8Array) =>
+    `data:${type};base64,${Buffer.from(bytes).toString('base64')}`;
+
+  it('accepts what fetchFavicon produces', async () => {
+    const pageSession = {
+      fetch: async () => new Response(png(16, 16), { headers: { 'content-type': 'image/png' } }),
+    } as unknown as Session;
+    const signal = new AbortController().signal;
+    const fetched = await fetchFavicon(pageSession, ['https://a.test/i.png'], signal);
+    expect(fetched).not.toBeNull();
+    expect(faviconFromDataUrl(fetched)).toBe(fetched);
+    const svg = dataUrl('image/svg+xml', new TextEncoder().encode('<svg/>'));
+    expect(faviconFromDataUrl(svg)).toBe(svg);
+  });
+
+  it('rejects anything that is not an image data URL', () => {
+    expect(faviconFromDataUrl(null)).toBeNull();
+    expect(faviconFromDataUrl(5)).toBeNull();
+    expect(faviconFromDataUrl('https://a.test/i.png')).toBeNull();
+    expect(faviconFromDataUrl(dataUrl('text/html', png(16, 16)))).toBeNull();
+  });
+
+  it.each(['constructor', '__proto__', 'toString'])(
+    'rejects the inherited object member %s as an image type',
+    (type) => {
+      expect(faviconFromDataUrl(dataUrl(type, ico([16, 16])))).toBeNull();
+    },
+  );
+
+  it('rejects bad base64', () => {
+    expect(faviconFromDataUrl('data:image/png;base64,@@@@')).toBeNull();
+    expect(faviconFromDataUrl(`${dataUrl('image/png', png(16, 16))}A`)).toBeNull();
+  });
+
+  it('rejects more than 64 KiB of image data', () => {
+    const big = new Uint8Array(64 * 1024 + 1);
+    big.set(png(16, 16));
+    expect(faviconFromDataUrl(dataUrl('image/png', big))).toBeNull();
+  });
+
+  it('rejects bytes that do not match the declared type', () => {
+    expect(faviconFromDataUrl(dataUrl('image/gif', png(16, 16)))).toBeNull();
+    expect(faviconFromDataUrl(dataUrl('image/png', png(999, 999)))).toBeNull();
   });
 });

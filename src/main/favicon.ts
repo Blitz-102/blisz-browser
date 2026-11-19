@@ -112,3 +112,19 @@ export async function fetchFavicon(
   }
   return svg;
 }
+
+// Re-checks an icon read back from disk, which is untrusted, with the same rules as a fetched one.
+export function faviconFromDataUrl(value: unknown): string | null {
+  if (typeof value !== 'string' || value.length > 2 * MAX_FAVICON_BYTES) return null; // base64 is ~4/3 of the bytes
+  const match = /^data:([a-z0-9.+/-]+);base64,([A-Za-z0-9+/]*={0,2})$/.exec(value);
+  const kind =
+    match?.[1] && Object.hasOwn(IMAGE_KINDS, match[1]) ? IMAGE_KINDS[match[1]] : undefined;
+  if (!match?.[2] || !kind) return null;
+  const bytes = Buffer.from(match[2], 'base64');
+  // Re-encoding catches stray or truncated base64 that decoding alone would let through.
+  const valid =
+    bytes.length <= MAX_FAVICON_BYTES &&
+    bytes.toString('base64') === match[2] &&
+    isValidFavicon(kind, bytes);
+  return valid ? value : null;
+}

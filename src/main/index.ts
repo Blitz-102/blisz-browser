@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { mkdirSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
+import type { DatabaseSync } from 'node:sqlite';
 import { pathToFileURL } from 'node:url';
 import {
   app,
@@ -15,10 +16,12 @@ import {
 } from 'electron';
 import { isWebUrl } from '../shared/url';
 import { runBench } from './bench';
+import { openDatabase } from './database';
 import { hasRunningDownload, initDownloads } from './downloads';
 import { addTrustedUi, handleFromUi, UI_URL } from './ipc';
 import { getMetrics } from './metrics';
 import { denyAllPermissions, installPermissionHandlers } from './permissions';
+import { readSession, writeSession } from './session';
 import {
   askPrompt,
   getTabProcessLabels,
@@ -30,6 +33,7 @@ import {
   offerExternalLink,
   pageDecisions,
   pageUrl,
+  restoreTabs,
 } from './tabs';
 
 // Native caption buttons via titleBarOverlay (PLAN 4.6); colours come from tokens.css.
@@ -196,7 +200,7 @@ app.on('certificate-error', (event, _contents, _url, _error, _certificate, callb
 // created later is covered too; the page session is then given prompts in createWindow.
 app.on('session-created', denyAllPermissions);
 
-function createWindow(): WebContents {
+function createWindow(db: DatabaseSync | null): WebContents {
   const window = new BaseWindow({
     width: 1280,
     height: 800,
@@ -225,13 +229,18 @@ function createWindow(): WebContents {
   });
   addTrustedUi(uiView.webContents);
   window.contentView.addChildView(uiView);
-  const pageSession = initTabs(window, uiView.webContents, hasRunningDownload);
+  const pageSession = initTabs(window, uiView.webContents, hasRunningDownload, (tabs) => {
+    if (db) writeSession(db, tabs);
+  });
   installPermissionHandlers(
     pageSession,
     { topUrl: pageUrl, isFullscreen, ask: askPrompt, mediaGranted },
     pageDecisions,
   );
   initDownloads(uiView.webContents, pageSession, saveDownloadsWithoutPrompt);
+  // Last, because the restored active tab loads at once and needs the user agent (set in initTabs)
+  // and the permission and download handlers above.
+  restoreTabs(db ? readSession(db) : []);
   handleShortcuts(uiView.webContents);
 
   // getContentBounds() is in screen coordinates; the view needs window-relative ones.
@@ -292,7 +301,9 @@ app.whenReady().then(() => {
   // The UI view never downloads; page views use their own session (see downloads.ts).
   session.defaultSession.on('will-download', (event) => event.preventDefault());
   handleFromUi('app:get-version', () => app.getVersion());
-  const ui = createWindow();
+  const db = openDatabase(join(app.getPath('userData'), 'blisz.db'));
+  app.on('will-quit', () => db?.close());
+  const ui = createWindow(db);
   handleFromUi('metrics:get', () => getMetrics(ui.getOSProcessId(), getTabProcessLabels()));
   if (benchMode) runBench(ui);
 });

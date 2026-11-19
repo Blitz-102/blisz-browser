@@ -30,6 +30,7 @@ import { popupPageMenu, popupTabMenu } from './contextMenu';
 import { fetchFavicon, webFaviconUrls } from './favicon';
 import { handleFromUi } from './ipc';
 import { DecisionStore, isExternalKind, PromptQueue, parseExternalLink } from './permissions';
+import type { SavedTab } from './session';
 import { matchShortcut, type ShortcutAction } from './shortcuts';
 import { shouldAutoSleep, sleepLimitMs } from './sleep';
 
@@ -99,6 +100,8 @@ const ZOOM_EPSILON = 0.01;
 // Background tabs that have been idle long enough fall asleep (see sleep.ts for the limits).
 const SLEEP_SWEEP_MS = 60_000;
 const MIN_SLEEP_OVERRIDE_MS = 1000; // keeps the sweep interval at 500 ms or more
+// The session is saved at most this often while tabs change, and again when the window closes.
+const SAVE_DELAY_MS = 2000;
 // Development only: BLISZ_SLEEP_AFTER_MS replaces the idle limit so tests don't wait 30 minutes.
 const devSleepLimitMs = !app.isPackaged ? Number(process.env.BLISZ_SLEEP_AFTER_MS) : Number.NaN;
 const sleepLimitOverride =
@@ -164,6 +167,7 @@ const lastSent = new Map<number, TabInfo>();
 const dirty = new Set<number>();
 let structureChanged = false; // tabs added, removed or activated since the last flush
 let flushTimer: NodeJS.Timeout | undefined;
+let saveTimer: NodeJS.Timeout | undefined;
 let nextTabId = 1;
 let activeId = 0;
 let insets: Insets | null = null;
@@ -174,6 +178,7 @@ let findText = ''; // the last query, for F3 and Ctrl+G
 let window: BaseWindow;
 let hasRunningDownload: (contents: WebContents) => boolean; // from downloads.ts, passed in to avoid an import cycle
 let ui: WebContents;
+let saveSession: (tabs: SavedTab[]) => void; // from index.ts, which owns the database
 
 // Called when camera or microphone access is allowed: such a tab is never put to sleep.
 export function mediaGranted(contents: WebContents): void {
@@ -511,6 +516,24 @@ function queueUpdate(id: number): void {
 function queueStructureUpdate(): void {
   structureChanged = true;
   flushTimer ??= setTimeout(flush, FLUSH_DELAY_MS);
+  queueSave();
+}
+
+// A throttle, not a debounce: a page whose title changes every second still gets saved.
+function queueSave(): void {
+  saveTimer ??= setTimeout(saveNow, SAVE_DELAY_MS);
+}
+
+// The snapshot holds browsing history, so a failure logs the message only.
+function saveNow(): void {
+  clearTimeout(saveTimer);
+  saveTimer = undefined;
+  if (window.isDestroyed()) return; // the views are gone; a save now would drop the tabs
+  try {
+    saveSession(sessionTabs());
+  } catch (error) {
+    if (!app.isPackaged) console.warn('Could not save the session:', (error as Error).message);
+  }
 }
 
 function getState(): TabsState {
@@ -658,13 +681,19 @@ function watchPageEvents(tab: Tab, view: WebContentsView): void {
     tab.recentDownloads = [];
     if (tab.id === activeId) closeFind();
     onChange();
+    queueSave();
   });
   contents.on('did-navigate-in-page', () => {
     if (tab.view !== view) return;
     refreshSleepRequest(tab, view);
     onChange();
+    queueSave();
   });
-  contents.on('page-title-updated', () => tab.view === view && onChange());
+  contents.on('page-title-updated', () => {
+    if (tab.view !== view) return;
+    onChange();
+    queueSave();
+  });
   contents.on('enter-html-full-screen', () => {
     if (tab.view !== view) return;
     if (tab.id !== activeId) {
@@ -793,6 +822,7 @@ function loadFavicon(tab: Tab, urls: string[]): void {
       if (favicon === null || controller.signal.aborted) return;
       tab.favicon = favicon;
       queueUpdate(tab.id);
+      queueSave();
     })
     .catch(() => {}); // a missing favicon just leaves the letter tile
 }
@@ -894,12 +924,36 @@ function historyToSave(tab: Tab): NonNullable<Tab['sleepState']> | null {
   // Sleeping the opener of an open popup would cut window.opener, which sign-in flows rely on.
   if (tabs.some((other) => other.opener === tab)) return null;
   if (tab.sleepState) return tab.sleepState; // still restoring: nothing newer than what was saved
-  const { navigationHistory } = tab.view.webContents;
+  return webHistory(tab.view.webContents);
+}
+
+// A live page's history reduced to web URLs, or null when its current page isn't a web page.
+function webHistory(contents: WebContents): NonNullable<Tab['sleepState']> | null {
+  const { navigationHistory } = contents;
   const entries = navigationHistory.getAllEntries();
   const current = entries[navigationHistory.getActiveIndex()];
   if (!current || !isWebUrl(current.url)) return null;
   const kept = entries.filter((entry) => isWebUrl(entry.url));
   return { entries: kept, index: kept.indexOf(current) };
+}
+
+// What a restart brings back: every tab on a web page, awake or asleep. pageState is dropped here
+// and again in writeSession, because it can hold form data.
+function sessionTabs(): SavedTab[] {
+  const saved: SavedTab[] = [];
+  for (const tab of tabs) {
+    const contents = tab.view?.webContents;
+    const history =
+      tab.sleepState ?? (contents && !contents.isDestroyed() ? webHistory(contents) : null);
+    if (!history) continue;
+    saved.push({
+      entries: history.entries.map(({ url, title }) => ({ url, title })),
+      index: history.index,
+      favicon: tab.favicon,
+      active: tab.id === activeId,
+    });
+  }
+  return saved;
 }
 
 // Destroys the page view, which frees its renderer, and keeps what the sidebar and wakeTab need.
@@ -993,6 +1047,21 @@ function discardView(tab: Tab): void {
   if (attachedView === view) detachView();
   tab.view = null;
   if (!view.webContents.isDestroyed()) view.webContents.close();
+}
+
+// Reopens the saved tabs, all asleep except the active one, which wakes through the normal path
+// (so a restored page gets the same scheme checks as any wake). Call after the page session's
+// user agent, permission and download handlers are set up, since the active tab loads at once.
+export function restoreTabs(saved: SavedTab[]): void {
+  let active: Tab | undefined;
+  for (const { entries, index, favicon, active: isActive } of saved) {
+    const tab = addTab(tabs.length);
+    tab.sleepState = { entries, index };
+    tab.favicon = favicon;
+    if (isActive) active = tab;
+  }
+  if (active) activateTab(active);
+  else createTab();
 }
 
 function createTab(): Tab {
@@ -1260,17 +1329,18 @@ function isPageArea(value: unknown): value is PageArea {
   );
 }
 
-// Creates the first (blank) tab and registers the tab IPC for the given window. Single window
+// Registers the tab IPC for the given window; restoreTabs() adds the first tabs. Single window
 // only: module state is shared and the IPC handlers are registered once.
 export function initTabs(
   appWindow: BaseWindow,
   uiContents: WebContents,
   isDownloading: (contents: WebContents) => boolean,
+  save: (tabs: SavedTab[]) => void,
 ): Electron.Session {
   window = appWindow;
   hasRunningDownload = isDownloading;
   ui = uiContents;
-  createTab();
+  saveSession = save;
 
   const pageSession = session.fromPartition(PAGE_PARTITION);
   pageSession.setUserAgent(toPageUserAgent(pageSession.getUserAgent()));
@@ -1368,9 +1438,13 @@ export function initTabs(
     },
     sleepLimitOverride ? Math.min(SLEEP_SWEEP_MS, sleepLimitOverride / 2) : SLEEP_SWEEP_MS,
   );
+  // The views are still alive on 'close', so this is the last moment the history can be read.
+  window.on('close', saveNow);
+  window.on('session-end', saveNow);
   // WebContentsView contents are not destroyed with the window.
   window.on('closed', () => {
     clearTimeout(flushTimer);
+    clearTimeout(saveTimer);
     clearInterval(sleepSweep);
     for (const tab of tabs) {
       tab.prompts.cancelAll();
