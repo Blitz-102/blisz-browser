@@ -50,6 +50,7 @@
   --pinned-tile-size: 46px;
   --favicon-size: 18px;
   --card-max-width: 420px;
+  --panel-max-width: 760px;
 
   /* Loading indicator */
   --spinner-size: 14px;

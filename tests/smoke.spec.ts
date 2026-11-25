@@ -2435,3 +2435,466 @@ test('Ctrl+Shift+T remembers at most 25 closed tabs', async () => {
     await close();
   }
 });
+
+// A fixture site for the history tests: pages with known titles, a link page, a 404, a page that
+// pushes a history entry, a page that never answers, and a request count per path so a test can tell
+// when a page has really been loaded.
+const HISTORY_TITLES: Record<string, string> = {
+  alpha: 'Apple pie',
+  beta: 'Banana bread',
+  gamma: 'Cherry tart',
+};
+
+async function startHistorySite() {
+  const hits = new Map<string, number>();
+  const server = createServer((request, response) => {
+    const path = request.url ?? '/';
+    hits.set(path, (hits.get(path) ?? 0) + 1);
+    response.setHeader('Content-Type', 'text/html');
+    response.setHeader('Cache-Control', 'no-store');
+    if (path === '/slow') {
+      // No answer: the navigation stays in flight until the connections are closed.
+    } else if (path === '/push') {
+      response.end(`<title>Push page</title>
+        <button onclick="history.pushState({}, '', '/push/state')">Push</button>
+        <a href="/doc/alpha">Go alpha</a>`);
+    } else if (path === '/missing') {
+      response.statusCode = 404;
+      response.end('<title>Gone</title><p>Not here</p>');
+    } else if (path === '/links') {
+      response.end(`<title>Links page</title>
+        <a href="/doc/alpha">Go alpha</a>
+        <a href="/doc/beta" target="_blank">Open beta</a>
+        <button onclick="window.open('about:blank')">Open blank</button>`);
+    } else {
+      const name = path.replace('/doc/', '');
+      response.end(`<title>${HISTORY_TITLES[name] ?? `Fixture ${name}`}</title><p>${path}</p>`);
+    }
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const close = () => {
+    server.closeAllConnections();
+    server.close();
+  };
+  return { base, hits, close };
+}
+
+// What the app has recorded so far, read like another process would. Empty while the file isn't
+// there yet or is locked for a moment.
+function readHistory(profile: string) {
+  try {
+    const db = new DatabaseSync(join(profile, 'blisz.db'), { readOnly: true });
+    try {
+      const visits = db
+        .prepare(
+          `SELECT u.url AS url, v.type AS type FROM history_visit v
+             JOIN history_url u ON u.id = v.url_id ORDER BY v.id`,
+        )
+        .all();
+      const pages = db.prepare('SELECT url, title FROM history_url ORDER BY id').all();
+      return {
+        visits: visits.map((row) => ({ url: String(row.url), type: String(row.type) })),
+        pages: pages.map((row) => ({ url: String(row.url), title: String(row.title) })),
+      };
+    } finally {
+      db.close();
+    }
+  } catch {
+    return { visits: [], pages: [] };
+  }
+}
+
+// The History button and the panel's search box and rows (one remove button per row).
+function historyPanel(ui: Page) {
+  return {
+    toggle: ui.getByRole('button', { name: 'History', exact: true }),
+    search: ui.getByRole('searchbox', { name: 'Search history' }),
+    rows: ui.getByRole('button', { name: /^Remove .* from history$/ }),
+  };
+}
+
+const toggleHistoryKey = (app: ElectronApplication) => pressKey(app, 'blisz://', 'H', ['control']);
+
+test('history: the panel lists visits, searches, removes and opens them', async () => {
+  const site = await startHistorySite();
+  let app: ElectronApplication | undefined;
+  try {
+    app = await launch();
+    const ui = await findUi(app);
+    const address = ui.getByRole('textbox', { name: 'Address' });
+    const { toggle, search, rows } = historyPanel(ui);
+
+    // Nothing has been visited yet.
+    await toggle.click();
+    await expect(search).toBeVisible();
+    await expect(ui.getByText('No history yet')).toBeVisible();
+    await toggle.click();
+    await expect(search).toHaveCount(0);
+
+    for (const name of ['alpha', 'beta', 'gamma']) {
+      await address.fill(`${site.base}/doc/${name}`);
+      await address.press('Enter');
+      await expect.poll(async () => (await tabsOf(ui)).tabs[0]?.title).toBe(HISTORY_TITLES[name]);
+    }
+
+    // The button opens the panel, newest page first; Ctrl+H closes it and opens it again.
+    const labels = () => rows.evaluateAll((buttons) => buttons.map((b) => b.ariaLabel));
+    await toggle.click();
+    await expect(ui.getByRole('heading', { name: 'Today' })).toBeVisible();
+    await expect
+      .poll(labels)
+      .toEqual([
+        'Remove Cherry tart from history',
+        'Remove Banana bread from history',
+        'Remove Apple pie from history',
+      ]);
+    await toggleHistoryKey(app);
+    await expect(search).toHaveCount(0);
+    await toggleHistoryKey(app);
+    await expect(rows).toHaveCount(3);
+
+    // Search matches the title or part of the URL, and says so when nothing matches.
+    await search.fill('banana');
+    await expect.poll(labels).toEqual(['Remove Banana bread from history']);
+    await search.fill('doc/gam');
+    await expect.poll(labels).toEqual(['Remove Cherry tart from history']);
+    await search.fill('zzz');
+    await expect(ui.getByText('No pages match “zzz”')).toBeVisible();
+    await expect(rows).toHaveCount(0);
+    await search.fill('');
+    await expect(rows).toHaveCount(3);
+
+    // Removing forgets the page, also after the panel is opened again.
+    await ui.getByRole('button', { name: 'Remove Banana bread from history' }).click();
+    await expect(rows).toHaveCount(2);
+    await toggleHistoryKey(app);
+    await toggleHistoryKey(app);
+    await expect
+      .poll(labels)
+      .toEqual(['Remove Cherry tart from history', 'Remove Apple pie from history']);
+
+    // Clicking a row opens that page in the active tab and closes the panel.
+    await ui.getByRole('button', { name: /^Apple pie/ }).click();
+    await expect(search).toHaveCount(0);
+    await expect.poll(async () => (await tabsOf(ui)).tabs[0]?.url).toBe(`${site.base}/doc/alpha`);
+    expect((await tabsOf(ui)).tabs).toHaveLength(1);
+  } finally {
+    await app?.close().catch(() => {});
+    site.close();
+  }
+});
+
+test('history: visits are typed, link, reload or back_forward, one page row per URL', async () => {
+  const profile = mkdtempSync(join(tmpdir(), 'blisz-history-'));
+  const site = await startHistorySite();
+  let app: ElectronApplication | undefined;
+  try {
+    app = await launch({}, profile);
+    const ui = await findUi(app);
+    const address = ui.getByRole('textbox', { name: 'Address' });
+    const tab = async () => (await tabsOf(ui)).tabs[0];
+    const pageAt = (url: string) => {
+      const view = app?.windows().find((window) => window.url() === url);
+      if (!view) throw new Error(`Page view not found at ${url}`);
+      return view;
+    };
+    // A reload has committed once the server has seen it and the tab is done loading.
+    const reloaded = async (path: string, count: number) => {
+      await expect.poll(() => site.hits.get(path)).toBe(count);
+      await expect.poll(async () => (await tab())?.isLoading).toBe(false);
+    };
+
+    await address.fill(`${site.base}/links`);
+    await address.press('Enter');
+    await expect.poll(async () => (await tab())?.title).toBe('Links page');
+
+    await pageAt(`${site.base}/links`).getByRole('link', { name: 'Go alpha' }).click();
+    await expect.poll(async () => (await tab())?.title).toBe('Apple pie');
+
+    await ui.getByRole('button', { name: 'Reload', exact: true }).click();
+    await reloaded('/doc/alpha', 2);
+    await pressKey(app, site.base, 'F5');
+    await reloaded('/doc/alpha', 3);
+
+    await ui.getByRole('button', { name: 'Back', exact: true }).click();
+    await expect.poll(async () => (await tab())?.url).toBe(`${site.base}/links`);
+    await reloaded('/links', 2);
+
+    // A link that opens a new tab is a link visit too.
+    await pageAt(`${site.base}/links`).getByRole('link', { name: 'Open beta' }).click();
+    await expect.poll(async () => (await tabsOf(ui)).tabs[1]?.title).toBe('Banana bread');
+
+    await stopApp(app); // quitting writes what is still queued
+
+    const { visits, pages } = readHistory(profile);
+    expect(visits).toEqual([
+      { url: `${site.base}/links`, type: 'typed' },
+      { url: `${site.base}/doc/alpha`, type: 'link' },
+      { url: `${site.base}/doc/alpha`, type: 'reload' },
+      { url: `${site.base}/doc/alpha`, type: 'reload' },
+      { url: `${site.base}/links`, type: 'back_forward' },
+      { url: `${site.base}/doc/beta`, type: 'link' },
+    ]);
+    expect(pages).toEqual([
+      { url: `${site.base}/links`, title: 'Links page' },
+      { url: `${site.base}/doc/alpha`, title: 'Apple pie' },
+      { url: `${site.base}/doc/beta`, title: 'Banana bread' },
+    ]);
+  } finally {
+    if (app) await stopApp(app, true).catch(() => {});
+    site.close();
+    removeProfile(profile);
+  }
+});
+
+test('history: a link clicked after Back across a pushState entry is a link visit', async () => {
+  const profile = mkdtempSync(join(tmpdir(), 'blisz-history-'));
+  const site = await startHistorySite();
+  let app: ElectronApplication | undefined;
+  try {
+    app = await launch({}, profile);
+    const ui = await findUi(app);
+    const address = ui.getByRole('textbox', { name: 'Address' });
+    const tab = async () => (await tabsOf(ui)).tabs[0];
+    const pageAt = (url: string) => {
+      const view = app?.windows().find((window) => window.url() === url);
+      if (!view) throw new Error(`Page view not found at ${url}`);
+      return view;
+    };
+
+    await address.fill(`${site.base}/push`);
+    await address.press('Enter');
+    await expect.poll(async () => (await tab())?.title).toBe('Push page');
+
+    // The pushed entry commits no page, so Back across it must not leave a flag behind.
+    await pageAt(`${site.base}/push`).getByRole('button', { name: 'Push' }).click();
+    await expect.poll(async () => (await tab())?.url).toBe(`${site.base}/push/state`);
+    await ui.getByRole('button', { name: 'Back', exact: true }).click();
+    await expect.poll(async () => (await tab())?.url).toBe(`${site.base}/push`);
+
+    await pageAt(`${site.base}/push`).getByRole('link', { name: 'Go alpha' }).click();
+    await expect.poll(async () => (await tab())?.title).toBe('Apple pie');
+    await stopApp(app);
+
+    expect(readHistory(profile).visits).toEqual([
+      { url: `${site.base}/push`, type: 'typed' },
+      { url: `${site.base}/doc/alpha`, type: 'link' },
+    ]);
+  } finally {
+    if (app) await stopApp(app, true).catch(() => {});
+    site.close();
+    removeProfile(profile);
+  }
+});
+
+test('history: typing a URL while another page is still loading is a typed visit', async () => {
+  const profile = mkdtempSync(join(tmpdir(), 'blisz-history-'));
+  const site = await startHistorySite();
+  let app: ElectronApplication | undefined;
+  try {
+    app = await launch({}, profile);
+    const ui = await findUi(app);
+    const address = ui.getByRole('textbox', { name: 'Address' });
+
+    await address.fill(`${site.base}/slow`);
+    await address.press('Enter');
+    await expect.poll(() => site.hits.get('/slow')).toBe(1);
+
+    // The second navigation replaces the first, which ends with ERR_ABORTED.
+    await address.fill(`${site.base}/doc/beta`);
+    await address.press('Enter');
+    await expect.poll(async () => (await tabsOf(ui)).tabs[0]?.title).toBe('Banana bread');
+    await stopApp(app);
+
+    expect(readHistory(profile).visits).toEqual([{ url: `${site.base}/doc/beta`, type: 'typed' }]);
+  } finally {
+    if (app) await stopApp(app, true).catch(() => {});
+    site.close();
+    removeProfile(profile);
+  }
+});
+
+test('history: restored, woken and reopened tabs add no visit', async () => {
+  const profile = mkdtempSync(join(tmpdir(), 'blisz-history-'));
+  const site = await startHistorySite();
+  let app: ElectronApplication | undefined;
+  try {
+    app = await launch({}, profile);
+    let ui = await findUi(app);
+    const firstId = (await tabsOf(ui)).activeId;
+    const secondId = await ui.evaluate<number>('window.bliss.createTab()');
+    for (const [id, name] of [
+      [firstId, 'alpha'],
+      [secondId, 'beta'],
+    ] as const) {
+      await ui.evaluate(`window.bliss.navigateTab(${id}, '${site.base}/doc/${name}')`);
+      await expect
+        .poll(async () => (await tabsOf(ui)).tabs.find((t) => t.id === id)?.title)
+        .toBe(HISTORY_TITLES[name]);
+    }
+    await ui.evaluate(`window.bliss.activateTab(${firstId})`);
+    await stopApp(app);
+    expect(readHistory(profile).visits.map((v) => v.type)).toEqual(['typed', 'typed']);
+
+    // The active tab loads again at once; the other one only when it is clicked.
+    app = await launch({}, profile);
+    ui = await findUi(app);
+    await expect.poll(() => site.hits.get('/doc/alpha')).toBe(2);
+    await expect
+      .poll(async () => (await tabsOf(ui)).tabs.map((t) => t.sleeping))
+      .toEqual([false, true]);
+    expect(site.hits.get('/doc/beta')).toBe(1);
+    const second = (await tabsOf(ui)).order[1] as number;
+    await ui.evaluate(`window.bliss.activateTab(${second})`);
+    await expect.poll(() => site.hits.get('/doc/beta')).toBe(2);
+
+    // A page opened now is a visit; closing it and reopening it with Ctrl+Shift+T is not.
+    const thirdId = await ui.evaluate<number>('window.bliss.createTab()');
+    await ui.evaluate(`window.bliss.navigateTab(${thirdId}, '${site.base}/doc/gamma')`);
+    await expect
+      .poll(async () => (await tabsOf(ui)).tabs.find((t) => t.id === thirdId)?.title)
+      .toBe('Cherry tart');
+    await ui.evaluate(`window.bliss.closeTab(${thirdId})`);
+    await expect.poll(async () => (await tabsOf(ui)).order.length).toBe(2);
+    await pressKey(app, 'blisz://', 'T', ['control', 'shift']);
+    await expect.poll(() => site.hits.get('/doc/gamma')).toBe(2);
+    await expect
+      .poll(async () => (await tabsOf(ui)).tabs.map((t) => t.isLoading))
+      .toEqual([false, false, false]);
+    await stopApp(app);
+
+    expect(readHistory(profile).visits).toEqual([
+      { url: `${site.base}/doc/alpha`, type: 'typed' },
+      { url: `${site.base}/doc/beta`, type: 'typed' },
+      { url: `${site.base}/doc/gamma`, type: 'typed' },
+    ]);
+  } finally {
+    if (app) await stopApp(app, true).catch(() => {});
+    site.close();
+    removeProfile(profile);
+  }
+});
+
+test('history: errors, a 404, blank tabs and about:blank popups add no visit; credentials and fragments are dropped', async () => {
+  const profile = mkdtempSync(join(tmpdir(), 'blisz-history-'));
+  const site = await startHistorySite();
+  // A port that nothing listens on.
+  const refused = createServer();
+  await new Promise<void>((resolve) => refused.listen(0, '127.0.0.1', resolve));
+  const refusedUrl = `http://127.0.0.1:${(refused.address() as AddressInfo).port}/`;
+  await new Promise<void>((resolve) => refused.close(() => resolve()));
+  let app: ElectronApplication | undefined;
+  try {
+    app = await launch({}, profile);
+    const ui = await findUi(app);
+    const activeTab = async () => {
+      const state = await tabsOf(ui);
+      return state.tabs.find((t) => t.id === state.activeId);
+    };
+    const open = async (url: string) => {
+      const id = (await tabsOf(ui)).activeId;
+      await ui.evaluate(`window.bliss.navigateTab(${id}, '${url}')`);
+    };
+
+    await open(`${site.base}/doc/alpha`);
+    await expect.poll(async () => (await activeTab())?.title).toBe('Apple pie');
+
+    // The plan assumes a network error fires did-fail-load and not did-navigate; record both.
+    await app.evaluate(({ webContents }, base) => {
+      const contents = webContents.getAllWebContents().find((c) => c.getURL().startsWith(base));
+      const events: string[] = [];
+      Object.assign(globalThis, { loadEvents: events });
+      contents?.on('did-navigate', (_event, url) => events.push(`did-navigate ${url}`));
+      contents?.on('did-fail-load', (_event, _code, _description, url, isMainFrame) => {
+        if (isMainFrame) events.push(`did-fail-load ${url}`);
+      });
+    }, site.base);
+    await open(refusedUrl);
+    await expect(ui.getByRole('region', { name: "Can't reach this page" })).toContainText(
+      'ERR_CONNECTION_REFUSED',
+    );
+    const events = await app.evaluate(
+      () => (globalThis as unknown as { loadEvents: string[] }).loadEvents,
+    );
+    expect(events).toContain(`did-fail-load ${refusedUrl}`);
+    expect(events).not.toContain(`did-navigate ${refusedUrl}`);
+
+    // A 404 page loads, but is not worth remembering.
+    await open(`${site.base}/missing`);
+    await expect.poll(() => site.hits.get('/missing')).toBe(1);
+    await expect.poll(async () => (await activeTab())?.url).toBe(`${site.base}/missing`);
+    await expect.poll(async () => (await activeTab())?.isLoading).toBe(false);
+
+    // An about:blank popup and a new blank tab.
+    await open(`${site.base}/links`);
+    await expect.poll(async () => (await activeTab())?.title).toBe('Links page');
+    const view = app.windows().find((window) => window.url() === `${site.base}/links`);
+    await view?.getByRole('button', { name: 'Open blank' }).click();
+    await expect.poll(async () => (await tabsOf(ui)).order.length).toBe(2);
+    await ui.evaluate('window.bliss.createTab()');
+    await expect.poll(async () => (await tabsOf(ui)).order.length).toBe(3);
+
+    // Credentials and the fragment never reach the database.
+    await open(`http://user:secret@${site.base.slice('http://'.length)}/doc/gamma#token=abc`);
+    await expect.poll(async () => (await activeTab())?.title).toBe('Cherry tart');
+    await stopApp(app);
+
+    const { visits, pages } = readHistory(profile);
+    expect(visits).toEqual([
+      { url: `${site.base}/doc/alpha`, type: 'typed' },
+      { url: `${site.base}/links`, type: 'typed' },
+      { url: `${site.base}/doc/gamma`, type: 'typed' },
+    ]);
+    expect(pages.map((page) => page.url)).toEqual(visits.map((visit) => visit.url));
+  } finally {
+    if (app) await stopApp(app, true).catch(() => {});
+    site.close();
+    removeProfile(profile);
+  }
+});
+
+test('history: the panel loads more pages when the list is scrolled to the end', async () => {
+  const profile = mkdtempSync(join(tmpdir(), 'blisz-history-'));
+  let app: ElectronApplication | undefined;
+  try {
+    // The first launch creates the tables; the rows go in while the app is not running.
+    app = await launch({}, profile);
+    await findUi(app);
+    await stopApp(app);
+    const db = new DatabaseSync(join(profile, 'blisz.db'));
+    try {
+      const insert = db.prepare(
+        'INSERT INTO history_url (url, title, last_visit_time) VALUES (?, ?, ?)',
+      );
+      const now = Date.now();
+      db.exec('BEGIN');
+      for (let i = 0; i < 230; i++)
+        insert.run(`http://seed.test/${i}`, `Seed ${i}`, now - i * 1000);
+      db.exec('COMMIT');
+    } finally {
+      db.close();
+    }
+
+    app = await launch({}, profile);
+    const ui = await findUi(app);
+    const { toggle, rows } = historyPanel(ui);
+    await toggle.click();
+    await expect(rows).toHaveCount(100);
+
+    // Scrolling the list to its end brings the next page in, until there are no more.
+    const scrollToEnd = () =>
+      ui.evaluate<number>(`(() => {
+        const buttons = document.querySelectorAll('button[aria-label^="Remove "]');
+        for (let el = buttons[buttons.length - 1]?.parentElement; el; el = el.parentElement) {
+          el.scrollTop = el.scrollHeight;
+        }
+        return buttons.length;
+      })()`);
+    await expect.poll(scrollToEnd, { timeout: 15_000 }).toBe(230);
+    await expect(ui.getByRole('button', { name: 'Remove Seed 229 from history' })).toBeVisible();
+  } finally {
+    if (app) await stopApp(app, true).catch(() => {});
+    removeProfile(profile);
+  }
+});

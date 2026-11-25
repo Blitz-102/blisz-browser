@@ -28,6 +28,7 @@ import { diffTabInfo } from '../shared/tabsUpdate';
 import { isWebUrl } from '../shared/url';
 import { popupPageMenu, popupTabMenu } from './contextMenu';
 import { fetchFavicon, webFaviconUrls } from './favicon';
+import type { HistoryRecorder, VisitType } from './history';
 import { handleFromUi } from './ipc';
 import { DecisionStore, isExternalKind, PromptQueue, parseExternalLink } from './permissions';
 import type { SavedTab } from './session';
@@ -103,6 +104,11 @@ const MIN_SLEEP_OVERRIDE_MS = 1000; // keeps the sweep interval at 500 ms or mor
 // The session is saved at most this often while tabs change, and again when the window closes.
 const SAVE_DELAY_MS = 2000;
 const MAX_CLOSED_TABS = 25;
+// A page that keeps setting location would add a history row per load. A page-started visit less than
+// MIN_PAGE_VISIT_GAP_MS after the tab's last one is dropped, unless the user clicked or typed in the
+// page within VISIT_INPUT_MS (a real click on a link right after a load is fine).
+const MIN_PAGE_VISIT_GAP_MS = 1000;
+const VISIT_INPUT_MS = 5000;
 // Development only: BLISZ_SLEEP_AFTER_MS replaces the idle limit so tests don't wait 30 minutes.
 const devSleepLimitMs = !app.isPackaged ? Number(process.env.BLISZ_SLEEP_AFTER_MS) : Number.NaN;
 const sleepLimitOverride =
@@ -141,6 +147,10 @@ interface Tab {
   mediaInUse: boolean; // camera or microphone was allowed for the current page
   // Set while a beforeunload-checked close of ours is in flight for this view; saved is what the tab keeps if the page agrees.
   sleepRequest: { view: WebContentsView; saved: NonNullable<Tab['sleepState']> } | null;
+  visitType: VisitType | null; // how the navigation in flight was started, if we know; cleared when it commits or fails
+  lastPageUrl: string; // the last committed main-frame URL, to tell a reload from a link to the same page
+  lastPageFailed: boolean; // the last committed response was an HTTP error (404 and the like): not recorded, so not retitled
+  lastRecordedAt: number; // when this tab last recorded a history visit
 }
 
 // The page area as distances from the window edges, so a window resize can be applied at once.
@@ -187,6 +197,7 @@ let window: BaseWindow;
 let hasRunningDownload: (contents: WebContents) => boolean; // from downloads.ts, passed in to avoid an import cycle
 let ui: WebContents;
 let saveSession: (tabs: SavedTab[]) => void; // from index.ts, which owns the database
+let record: HistoryRecorder; // from history.ts via index.ts; tabs.ts never touches the database
 
 // Called when camera or microphone access is allowed: such a tab is never put to sleep.
 export function mediaGranted(contents: WebContents): void {
@@ -264,7 +275,7 @@ function attachPage(tab: Tab, view: WebContentsView): void {
   });
   // A link opened from DevTools becomes a tab, web URLs only (never shell.openExternal).
   contents.on('devtools-open-url', (_event, url) => {
-    if (isWebUrl(url)) navigate(createTab(), url);
+    if (isWebUrl(url)) navigate(createTab(), url, 'link');
   });
   contents.on('context-menu', (_event, params) => {
     if (tab.view !== view) return;
@@ -297,7 +308,7 @@ function openInNewTab(opener: Tab, url: string, { background }: { background: bo
   tab.opener = opener;
   tab.openedAt = Date.now();
   if (!background) activateTab(tab);
-  navigate(tab, url);
+  navigate(tab, url, 'link');
 }
 
 function saveAs(tab: Tab, url: string, kind: 'save-image' | 'save-link'): void {
@@ -636,7 +647,12 @@ function watchPageEvents(tab: Tab, view: WebContentsView): void {
   contents.on('did-stop-loading', onChange);
   // A new page load drops the old error.
   contents.on('did-start-navigation', (details) => {
-    if (tab.view !== view || !details.isMainFrame || details.isSameDocument) return;
+    if (tab.view !== view || !details.isMainFrame) return;
+    if (details.isSameDocument) {
+      // No did-navigate follows, so the flag would otherwise leak to the next page.
+      tab.visitType = null;
+      return;
+    }
     // Backstop for a restore, which is started by main and skips will-navigate (a page's own
     // navigations are checked there). about:blank is what OAuth popups start with.
     if (tab.sleepState && details.url !== 'about:blank' && !isWebUrl(details.url)) {
@@ -652,6 +668,8 @@ function watchPageEvents(tab: Tab, view: WebContentsView): void {
   contents.on('did-fail-load', (_event, code, description, url, isMainFrame) => {
     if (tab.view !== view) return;
     const error = isMainFrame ? loadError(code, description, url) : null; // a trailing -3 changes nothing
+    // -3 (ERR_ABORTED) is the old navigation being replaced by a new one, which owns the flag now.
+    if (isMainFrame && code !== -3) tab.visitType = null;
     if (!error) return;
     setError(tab, error);
     tab.sleepState = null; // a failed restore shows the error card like any failed load
@@ -665,7 +683,7 @@ function watchPageEvents(tab: Tab, view: WebContentsView): void {
     setError(tab, { kind: 'crashed' });
     onChange();
   });
-  contents.on('did-navigate', (_event, url) => {
+  contents.on('did-navigate', (_event, url, httpResponseCode) => {
     if (tab.view !== view) return;
     // The deferred stop above can lose the race; whatever committed must still be a web page.
     if (url !== 'about:blank' && !isWebUrl(url)) {
@@ -679,6 +697,24 @@ function watchPageEvents(tab: Tab, view: WebContentsView): void {
     setError(tab, null);
     // A woken tab keeps the favicon it slept with; page-favicon-updated refreshes it.
     const restoredSamePage = savedEntry(tab)?.url === contents.getURL();
+    // A wake, session restore or reopen is not a new visit.
+    const restoring = tab.sleepState !== null;
+    const pageStarted = tab.visitType === null;
+    const type = tab.visitType ?? (url === tab.lastPageUrl ? 'reload' : 'link');
+    tab.visitType = null;
+    tab.lastPageUrl = url;
+    tab.lastPageFailed = httpResponseCode >= 400;
+    if (!restoring && !tab.lastPageFailed) {
+      const now = Date.now();
+      const flooding =
+        pageStarted &&
+        now - tab.lastRecordedAt < MIN_PAGE_VISIT_GAP_MS &&
+        now - tab.lastInputAt >= VISIT_INPUT_MS;
+      if (!flooding) {
+        record.recordVisit(url, type);
+        tab.lastRecordedAt = now;
+      }
+    }
     tab.sleepState = null;
     if (!restoredSamePage) resetFavicon(tab);
     tab.blockedPopups = 0;
@@ -697,8 +733,10 @@ function watchPageEvents(tab: Tab, view: WebContentsView): void {
     onChange();
     queueSave();
   });
-  contents.on('page-title-updated', () => {
+  contents.on('page-title-updated', (_event, title) => {
     if (tab.view !== view) return;
+    // Keyed by the committed URL, which getURL() can leave behind while a new page is pending.
+    if (!tab.lastPageFailed) record.updateTitle(tab.lastPageUrl, title);
     onChange();
     queueSave();
   });
@@ -836,13 +874,14 @@ function loadFavicon(tab: Tab, urls: string[]): void {
 }
 
 // Returns whether a navigation started.
-function navigate(tab: Tab, input: string): boolean {
+function navigate(tab: Tab, input: string, visitType: VisitType): boolean {
   const target = toNavigableUrl(input);
   // loadURL from main doesn't fire will-navigate, so the scheme is checked here.
   if (!isWebUrl(target)) {
     if (target !== '' && !app.isPackaged) console.warn(`Refused to navigate to ${target}`);
     return false;
   }
+  tab.visitType = visitType;
   tab.sleepState = null; // the user is going elsewhere; there is nothing left to restore
   if (tab.sleepRequest) {
     tab.sleepRequest = null;
@@ -882,6 +921,10 @@ function addTab(index: number): Tab {
     lastActiveAt: Date.now(),
     mediaInUse: false,
     sleepRequest: null,
+    visitType: null,
+    lastPageUrl: '',
+    lastPageFailed: false,
+    lastRecordedAt: 0,
   };
   tabs.splice(index, 0, tab);
   queueUpdate(tab.id); // sends the new tab's full info
@@ -1082,7 +1125,7 @@ function duplicateTab(source: Tab): Tab {
   const tab = addTab(tabs.indexOf(source) + 1);
   activateTab(tab);
   const url = savedEntry(source)?.url ?? source.view?.webContents.getURL();
-  if (url) navigate(tab, url);
+  if (url) navigate(tab, url, 'other');
   return tab;
 }
 
@@ -1131,7 +1174,7 @@ function reopenClosedTab(): void {
 export function openBenchTabs(urls: string[]): void {
   for (const [index, url] of urls.entries()) {
     const tab = index === 0 ? tabs[0] : createTab();
-    if (tab) navigate(tab, url);
+    if (tab) navigate(tab, url, 'typed');
   }
 }
 
@@ -1169,6 +1212,16 @@ function go(tab: Tab, action: TabAction): void {
     return;
   }
   const contents = tab.view.webContents;
+  const { navigationHistory } = contents;
+  if (action === 'reload') tab.visitType = 'reload';
+  else if (
+    (action === 'back' && navigationHistory.canGoBack()) ||
+    (action === 'forward' && navigationHistory.canGoForward())
+  ) {
+    tab.visitType = 'back_forward';
+  } else if (action === 'stop') {
+    tab.visitType = null; // a stopped load fails with -3, which no longer clears the flag
+  }
   if (action === 'back') contents.navigationHistory.goBack();
   else if (action === 'forward') contents.navigationHistory.goForward();
   else if (action === 'reload') contents.reload();
@@ -1252,7 +1305,10 @@ function runShortcut(action: ShortcutAction): void {
       if (active) go(active, action);
       break;
     case 'reload-ignoring-cache':
-      active?.view?.webContents.reloadIgnoringCache();
+      if (active?.view) {
+        active.visitType = 'reload';
+        active.view.webContents.reloadIgnoringCache();
+      }
       break;
     case 'toggle-devtools':
       if (active?.view) toggleDevTools(active.view.webContents);
@@ -1265,6 +1321,10 @@ function runShortcut(action: ShortcutAction): void {
       findOpen = true;
       ui.focus();
       ui.send('ui:open-find');
+      break;
+    case 'toggle-history':
+      ui.focus();
+      ui.send('ui:toggle-history');
       break;
     case 'find-next':
     case 'find-previous':
@@ -1367,11 +1427,13 @@ export function initTabs(
   uiContents: WebContents,
   isDownloading: (contents: WebContents) => boolean,
   save: (tabs: SavedTab[]) => void,
+  historyRecorder: HistoryRecorder,
 ): Electron.Session {
   window = appWindow;
   hasRunningDownload = isDownloading;
   ui = uiContents;
   saveSession = save;
+  record = historyRecorder;
 
   const pageSession = session.fromPartition(PAGE_PARTITION);
   pageSession.setUserAgent(toPageUserAgent(pageSession.getUserAgent()));
@@ -1380,7 +1442,7 @@ export function initTabs(
   handleFromUi('tab:navigate', (_event, id, input) => {
     const tab = getTab(id);
     if (typeof input !== 'string' || input.length > MAX_INPUT_LENGTH) throw new Error('Bad input');
-    return navigate(tab, input);
+    return navigate(tab, input, 'typed');
   });
   handleFromUi('tab:go', (_event, id, action) => {
     const tab = getTab(id);

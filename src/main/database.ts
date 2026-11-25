@@ -15,6 +15,20 @@ const MIGRATIONS: string[] = [
      hash TEXT PRIMARY KEY,
      data TEXT NOT NULL
    ) STRICT;`,
+  `CREATE TABLE history_url (
+     id INTEGER PRIMARY KEY,
+     url TEXT NOT NULL UNIQUE,
+     title TEXT NOT NULL DEFAULT '',
+     last_visit_time INTEGER NOT NULL
+   ) STRICT;
+   CREATE INDEX history_url_last_visit ON history_url (last_visit_time, id);
+   CREATE TABLE history_visit (
+     id INTEGER PRIMARY KEY,
+     url_id INTEGER NOT NULL REFERENCES history_url (id) ON DELETE CASCADE,
+     visit_time INTEGER NOT NULL,
+     type TEXT NOT NULL
+   ) STRICT;
+   CREATE INDEX history_visit_url ON history_visit (url_id);`,
 ];
 
 // SQLITE_CORRUPT and SQLITE_NOTADB, including their extended codes.
@@ -31,7 +45,7 @@ function isCorrupt(error: unknown): boolean {
 
 // Null when the file was written by a newer build; it is left untouched.
 function openAndMigrate(file: string): DatabaseSync | null {
-  const db = new DatabaseSync(file, { defensive: true });
+  const db = new DatabaseSync(file, { defensive: true, enableForeignKeyConstraints: true });
   try {
     db.exec('PRAGMA trusted_schema = OFF');
     const row = db.prepare('PRAGMA user_version').get() as { user_version: number };

@@ -18,6 +18,7 @@ import { isWebUrl } from '../shared/url';
 import { runBench } from './bench';
 import { openDatabase } from './database';
 import { hasRunningDownload, initDownloads } from './downloads';
+import { type HistoryRecorder, initHistory } from './history';
 import { addTrustedUi, handleFromUi, UI_URL } from './ipc';
 import { getMetrics } from './metrics';
 import { denyAllPermissions, installPermissionHandlers } from './permissions';
@@ -200,7 +201,7 @@ app.on('certificate-error', (event, _contents, _url, _error, _certificate, callb
 // created later is covered too; the page session is then given prompts in createWindow.
 app.on('session-created', denyAllPermissions);
 
-function createWindow(db: DatabaseSync | null): WebContents {
+function createWindow(db: DatabaseSync | null, history: HistoryRecorder): WebContents {
   const window = new BaseWindow({
     width: 1280,
     height: 800,
@@ -229,9 +230,15 @@ function createWindow(db: DatabaseSync | null): WebContents {
   });
   addTrustedUi(uiView.webContents);
   window.contentView.addChildView(uiView);
-  const pageSession = initTabs(window, uiView.webContents, hasRunningDownload, (tabs) => {
-    if (db) writeSession(db, tabs);
-  });
+  const pageSession = initTabs(
+    window,
+    uiView.webContents,
+    hasRunningDownload,
+    (tabs) => {
+      if (db) writeSession(db, tabs);
+    },
+    history,
+  );
   installPermissionHandlers(
     pageSession,
     { topUrl: pageUrl, isFullscreen, ask: askPrompt, mediaGranted },
@@ -302,8 +309,12 @@ app.whenReady().then(() => {
   session.defaultSession.on('will-download', (event) => event.preventDefault());
   handleFromUi('app:get-version', () => app.getVersion());
   const db = openDatabase(join(app.getPath('userData'), 'blisz.db'));
-  app.on('will-quit', () => db?.close());
-  const ui = createWindow(db);
+  const history = initHistory(db);
+  app.on('will-quit', () => {
+    history.flush(); // before close, or the last 2 seconds of visits are lost
+    db?.close();
+  });
+  const ui = createWindow(db, history);
   handleFromUi('metrics:get', () => getMetrics(ui.getOSProcessId(), getTabProcessLabels()));
   if (benchMode) runBench(ui);
 });

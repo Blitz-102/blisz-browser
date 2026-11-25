@@ -15,6 +15,7 @@ export type ShortcutAction =
   | 'toggle-devtools'
   | 'toggle-ui-devtools'
   | 'find'
+  | 'toggle-history'
   | 'find-next'
   | 'find-previous'
   | 'zoom-in'
@@ -77,6 +78,8 @@ export function matchShortcut(input: ShortcutInput): ShortcutAction | null {
         return 'focus-address';
       case 'f':
         return 'find';
+      case 'h':
+        return 'toggle-history';
       case 'g':
         return 'find-next';
       case 'r':

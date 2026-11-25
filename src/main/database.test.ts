@@ -17,16 +17,16 @@ const pragma = (db: DatabaseSync, name: string) =>
   Object.values(db.prepare(`PRAGMA ${name}`).get() as Record<string, unknown>)[0];
 
 describe('openDatabase', () => {
-  it('creates the session tables at user_version 1 in WAL mode', () => {
+  it('creates the session and history tables at user_version 2 in WAL mode', () => {
     const db = openDatabase(file) as DatabaseSync;
     expect(db).not.toBeNull();
-    expect(pragma(db, 'user_version')).toBe(1);
+    expect(pragma(db, 'user_version')).toBe(2);
     expect(pragma(db, 'journal_mode')).toBe('wal');
     const tables = db
       .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name")
       .all()
       .map((row) => row.name);
-    expect(tables).toEqual(['session_favicon', 'session_tab']);
+    expect(tables).toEqual(['history_url', 'history_visit', 'session_favicon', 'session_tab']);
     db.close();
   });
 
@@ -37,6 +37,30 @@ describe('openDatabase', () => {
     const second = openDatabase(file) as DatabaseSync;
     expect(second.prepare('SELECT count(*) AS n FROM session_tab').get()).toEqual({ n: 1 });
     second.close();
+  });
+
+  it('upgrades a version 1 file and keeps its session', () => {
+    const old = new DatabaseSync(file);
+    old.exec(`CREATE TABLE session_tab (
+      position INTEGER PRIMARY KEY,
+      active INTEGER NOT NULL,
+      entry_index INTEGER NOT NULL,
+      entries TEXT NOT NULL,
+      favicon TEXT
+    ) STRICT;
+    CREATE TABLE session_favicon (
+      hash TEXT PRIMARY KEY,
+      data TEXT NOT NULL
+    ) STRICT;
+    INSERT INTO session_tab VALUES (0, 1, 0, '[]', NULL);
+    PRAGMA user_version = 1`);
+    old.close();
+    const db = openDatabase(file) as DatabaseSync;
+    expect(pragma(db, 'user_version')).toBe(2);
+    expect(db.prepare('SELECT count(*) AS n FROM session_tab').get()).toEqual({ n: 1 });
+    expect(db.prepare('SELECT count(*) AS n FROM history_url').get()).toEqual({ n: 0 });
+    expect(db.prepare('SELECT count(*) AS n FROM history_visit').get()).toEqual({ n: 0 });
+    db.close();
   });
 
   it('returns null for a file from a newer version and leaves it untouched', () => {
@@ -52,7 +76,7 @@ describe('openDatabase', () => {
     writeFileSync(file, 'this is definitely not an sqlite database file '.repeat(50));
     const db = openDatabase(file) as DatabaseSync;
     expect(db).not.toBeNull();
-    expect(pragma(db, 'user_version')).toBe(1);
+    expect(pragma(db, 'user_version')).toBe(2);
     db.close();
     expect(readdirSync(dir)).toContain('blisz.db.broken');
     expect(readFileSync(`${file}.broken`, 'utf8')).toContain('not an sqlite');

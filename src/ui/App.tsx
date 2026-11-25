@@ -7,10 +7,12 @@ import styles from './App.module.css';
 import { Downloads } from './Downloads';
 import { ErrorCard } from './ErrorCard';
 import { FindStrip } from './FindStrip';
+import { HistoryPanel } from './HistoryPanel';
 import {
   ActivityIcon,
   ArrowLeftIcon,
   ArrowRightIcon,
+  HistoryIcon,
   RotateCwIcon,
   ShieldIcon,
   XIcon,
@@ -21,7 +23,8 @@ import { PinnedSites } from './PinnedSites';
 import { TabList } from './TabList';
 
 export function App() {
-  const [memoryOpen, setMemoryOpen] = useState(false);
+  // A panel takes the page's place while it is open.
+  const [panel, setPanel] = useState<'memory' | 'history' | null>(null);
   // The tab state comes from main, which owns the tabs.
   const [tabsState, setTabsState] = useState<TabsState | null>(null);
   const [downloads, setDownloads] = useState<DownloadInfo[]>([]);
@@ -72,10 +75,10 @@ export function App() {
   );
 
   // Ctrl+F is handled in main, which also closes the strip on tab switches and navigation.
-  // The memory panel takes the page's place, so there is nothing to search there.
+  // A panel takes the page's place, so there is nothing to search there.
   useEffect(() => {
     const unsubscribeOpen = window.bliss.onOpenFind(() => {
-      if (memoryOpen) {
+      if (panel !== null) {
         if (activeTab) window.bliss.findStop(activeTab.id, false); // main already counted it as open
         return;
       }
@@ -87,9 +90,9 @@ export function App() {
       unsubscribeOpen();
       unsubscribeClose();
     };
-  }, [memoryOpen, activeTab]);
+  }, [panel, activeTab]);
 
-  // Tell main where the page goes. While the memory panel is open it takes the page's place.
+  // Tell main where the page goes. While a panel is open it takes the page's place.
   useEffect(() => {
     const page = pageRef.current;
     if (!page) return;
@@ -97,17 +100,17 @@ export function App() {
       const { x, y, width, height } = page.getBoundingClientRect();
       const radius = Number.parseFloat(getComputedStyle(page).borderTopLeftRadius) || 0;
       window.bliss
-        .setPageArea({ x, y, width, height, radius, hidden: memoryOpen })
+        .setPageArea({ x, y, width, height, radius, hidden: panel !== null })
         .catch((error) => console.warn('Could not set the page area:', error));
     };
     const observer = new ResizeObserver(report);
     observer.observe(page);
     return () => observer.disconnect();
-  }, [memoryOpen]);
+  }, [panel]);
 
   function submitAddress() {
     if (!activeTab || draft === null) return;
-    setMemoryOpen(false);
+    setPanel(null);
     const text = toNavigableUrl(draft);
     if (text !== '') setSubmitted(text);
     window.bliss.navigateTab(activeTab.id, draft).then((started) => {
@@ -121,18 +124,24 @@ export function App() {
     if (activeTab) window.bliss.findStop(activeTab.id, focusPage);
   }
 
-  function toggleMemory() {
-    if (!memoryOpen && findOpen) closeFind(false); // the UI keeps the keyboard
-    setMemoryOpen(!memoryOpen);
+  function togglePanel(name: 'memory' | 'history') {
+    if (panel === null && findOpen) closeFind(false); // the UI keeps the keyboard
+    setPanel((current) => (current === name ? null : name));
   }
 
+  // Ctrl+H is handled in main, which focuses the UI and sends this. The ref keeps the subscription
+  // stable while the handler always sees the current find state and tab.
+  const togglePanelRef = useRef(togglePanel);
+  togglePanelRef.current = togglePanel;
+  useEffect(() => window.bliss.onToggleHistory(() => togglePanelRef.current('history')), []);
+
   function selectTab(id: number) {
-    setMemoryOpen(false);
+    setPanel(null);
     window.bliss.activateTab(id);
   }
 
   function addTab() {
-    setMemoryOpen(false);
+    setPanel(null);
     window.bliss.createTab();
   }
 
@@ -239,23 +248,42 @@ export function App() {
           onCancel={(id) => window.bliss.cancelDownload(id)}
           onClear={() => window.bliss.clearDownloads()}
         />
-        <button
-          type="button"
-          className={styles.memoryToggle}
-          aria-pressed={memoryOpen}
-          onClick={toggleMemory}
-        >
-          <ActivityIcon />
-          Memory
-        </button>
+        <div className={styles.footer}>
+          <button
+            type="button"
+            className={styles.panelToggle}
+            aria-pressed={panel === 'memory'}
+            onClick={() => togglePanel('memory')}
+          >
+            <ActivityIcon />
+            Memory
+          </button>
+          <button
+            type="button"
+            className={styles.panelToggle}
+            aria-pressed={panel === 'history'}
+            onClick={() => togglePanel('history')}
+          >
+            <HistoryIcon />
+            History
+          </button>
+        </div>
       </nav>
       <div className={styles.pageColumn}>
         {findOpen && activeTab && (
           <FindStrip tabId={activeTab.id} focusRequest={findRequest} onClose={() => closeFind()} />
         )}
         <main ref={pageRef} className={styles.page}>
-          {memoryOpen ? (
+          {panel === 'memory' ? (
             <MemoryPanel />
+          ) : panel === 'history' ? (
+            <HistoryPanel
+              onOpen={(url) => {
+                if (!activeTab) return;
+                setPanel(null);
+                window.bliss.navigateTab(activeTab.id, url);
+              }}
+            />
           ) : activeTab?.error ? (
             <ErrorCard
               error={activeTab.error}

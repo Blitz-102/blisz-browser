@@ -106,6 +106,13 @@ describe('matchShortcut', () => {
     expect(matchShortcut(press('f'))).toBeNull();
   });
 
+  it('toggles history on plain Ctrl+H only', () => {
+    expect(matchShortcut(press('h', { control: true }))).toBe('toggle-history');
+    expect(matchShortcut(press('H', { control: true, shift: true }))).toBeNull();
+    expect(matchShortcut(press('h', { control: true, alt: true }))).toBeNull();
+    expect(matchShortcut(press('h'))).toBeNull();
+  });
+
   it('zooms with Ctrl and the physical key', () => {
     expect(matchShortcut(press('=', { control: true, code: 'Equal' }))).toBe('zoom-in');
     expect(matchShortcut(press('+', { control: true, shift: true, code: 'Equal' }))).toBe(

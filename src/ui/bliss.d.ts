@@ -24,6 +24,11 @@ interface Window {
       options: import('../shared/tabs').FindOptions,
     ): Promise<void>;
     findStop(id: number, focusPage: boolean): Promise<void>;
+    queryHistory(
+      text: string,
+      cursor: import('../shared/history').HistoryCursor | null,
+    ): Promise<import('../shared/history').HistoryPage>;
+    deleteHistory(id: number): Promise<void>;
     setPageArea(area: import('../shared/tabs').PageArea): Promise<void>;
     onTabsUpdate(callback: (update: import('../shared/tabs').TabsUpdate) => void): () => void;
     onDownloadsUpdate(
@@ -32,6 +37,7 @@ interface Window {
     onFocusAddress(callback: () => void): () => void;
     onOpenFind(callback: () => void): () => void;
     onCloseFind(callback: () => void): () => void;
+    onToggleHistory(callback: () => void): () => void;
     onFindResult(callback: (result: import('../shared/tabs').FindResult) => void): () => void;
   };
 }

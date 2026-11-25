@@ -1,5 +1,6 @@
 import { contextBridge, type IpcRendererEvent, ipcRenderer } from 'electron';
 import type { DownloadInfo } from '../shared/downloads';
+import type { HistoryCursor, HistoryPage } from '../shared/history';
 import type { MetricsResult } from '../shared/metrics';
 import type {
   FindOptions,
@@ -35,6 +36,9 @@ contextBridge.exposeInMainWorld('bliss', {
     ipcRenderer.invoke('find:query', id, text, options),
   findStop: (id: number, focusPage: boolean): Promise<void> =>
     ipcRenderer.invoke('find:stop', id, focusPage),
+  queryHistory: (text: string, cursor: HistoryCursor | null): Promise<HistoryPage> =>
+    ipcRenderer.invoke('history:query', text, cursor),
+  deleteHistory: (id: number): Promise<void> => ipcRenderer.invoke('history:delete', id),
   setPageArea: (area: PageArea): Promise<void> => ipcRenderer.invoke('page:set-area', area),
   // The IPC event object stays in the preload; the UI only gets the update. Returns an unsubscribe function.
   onTabsUpdate: (callback: (update: TabsUpdate) => void): (() => void) => {
@@ -63,6 +67,12 @@ contextBridge.exposeInMainWorld('bliss', {
     const listener = () => callback();
     ipcRenderer.on('ui:close-find', listener);
     return () => ipcRenderer.removeListener('ui:close-find', listener);
+  },
+  // Main asks the UI to open or close the history panel (Ctrl+H).
+  onToggleHistory: (callback: () => void): (() => void) => {
+    const listener = () => callback();
+    ipcRenderer.on('ui:toggle-history', listener);
+    return () => ipcRenderer.removeListener('ui:toggle-history', listener);
   },
   onFindResult: (callback: (result: FindResult) => void): (() => void) => {
     const listener = (_event: IpcRendererEvent, result: FindResult) => callback(result);
